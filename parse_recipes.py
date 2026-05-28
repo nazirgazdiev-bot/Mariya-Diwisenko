@@ -9,14 +9,23 @@
 """
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
 import pypdf
 
-PDF_PATH = "/sessions/wonderful-adoring-knuth/mnt/uploads/Сборник_полезных_рецептов_обновленный.pdf"
-OUT_JSON = "/sessions/wonderful-adoring-knuth/mnt/outputs/recipes.json"
+# Пути относительно расположения скрипта — кладёт recipes.json рядом.
+# Можно переопределить через переменные окружения PDF_PATH и OUT_JSON.
+PDF_PATH = os.environ.get(
+    "PDF_PATH",
+    "/sessions/wonderful-adoring-knuth/mnt/uploads/Сборник_полезных_рецептов_обновленный.pdf",
+)
+OUT_JSON = os.environ.get(
+    "OUT_JSON",
+    str(Path(__file__).parent / "recipes.json"),
+)
 
 # Категории (нормализованные) и слова-маркеры в шапке страницы
 CATEGORIES = [
@@ -44,8 +53,18 @@ PAGE_HEADER_RE = re.compile(
     r"САЛАТЫ[^\n]*ВЫПЕЧКА|ГАРНИРЫ И КАШИ|ДЕСЕРТЫ И СЛАДКАЯ ВЫПЕЧКА)\s+\d+"
 )
 
-# Маркеры порции
-PORTION_RE = re.compile(r"(НА ОДНУ ПОРЦИЮ|НА \d+ ПОРЦИИ?|НА 100 ?ГР|На одну порцию)", re.IGNORECASE)
+# Маркеры порции — порядок важен (специфичные сначала). Дефолт = per_100g,
+# по словам Маши: "В большинстве рецептов КБЖУ указаны на 100 гр готового блюда"
+PORTION_PATTERNS = [
+    # "на порцию" — самое жёсткое указание
+    (re.compile(r"НА\s+ОДНУ\s+ПОРЦИЮ", re.IGNORECASE), "per_portion"),
+    (re.compile(r"НА\s+ИТОГОВУЮ\s+ПОРЦИЮ", re.IGNORECASE), "per_portion"),
+    (re.compile(r"НА\s+\d+\s+ПОРЦИ", re.IGNORECASE), "per_portion"),
+    (re.compile(r"НА\s+ПОРЦИЮ", re.IGNORECASE), "per_portion"),
+    (re.compile(r"1\s+ПОРЦИЯ\s*:", re.IGNORECASE), "per_portion"),
+    # "на 100г" / "на 100 грамм"
+    (re.compile(r"НА\s+100\s*Г(?:Р|РАММ|РАММОВ)?", re.IGNORECASE), "per_100g"),
+]
 
 
 def parse_toc(reader):
@@ -100,13 +119,14 @@ def parse_kbju(text):
 
 
 def detect_portion(text):
-    """100гр / порция / неуказано."""
-    if PORTION_RE.search(text):
-        m = PORTION_RE.search(text)
-        if m and "100" in m.group(0):
-            return "per_100g"
-        return "per_portion"
-    return "unspecified"
+    """
+    Возвращает 'per_portion' если КБЖУ указан на всю порцию,
+    'per_100g' если на 100г или маркер не найден (это дефолт у Маши).
+    """
+    for pattern, kind in PORTION_PATTERNS:
+        if pattern.search(text):
+            return kind
+    return "per_100g"  # дефолт по словам Маши (страница 4 сборника)
 
 
 def parse_ingredients(text):
