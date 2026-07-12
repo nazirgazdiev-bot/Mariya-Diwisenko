@@ -262,6 +262,10 @@ def iso_in(seconds: float) -> str:
 
 
 prodamus_client = ProdamusClient(PRODAMUS_SECRET_KEY or "", PRODAMUS_SHOP_URL) if PRODAMUS_SECRET_KEY else None
+# Тестовый режим Продамуса: платёж проходит без реальной карты, подпись при этом
+# остаётся боевой (не влияет на проверку вебхука) — включается только через env var,
+# чтобы не забыть выключить перед реальными платежами.
+PRODAMUS_DEMO_MODE = os.environ.get("PRODAMUS_DEMO_MODE", "0") == "1"
 
 async def generate_payment_link(user_id: str, tier: str) -> str:
     """Генерирует ссылку на оплату Продамуса.
@@ -281,6 +285,9 @@ async def generate_payment_link(user_id: str, tier: str) -> str:
             }
         ],
     }
+    if PRODAMUS_DEMO_MODE:
+        data["demo_mode"] = 1
+        log.warning("Продамус: ссылка сгенерирована в ДЕМО-режиме (PRODAMUS_DEMO_MODE=1)")
     return prodamus_client.build_payment_link(data)
 
 
@@ -748,23 +755,4 @@ async def handle_text(message: Message):
     if new_facts:
         await storage.add_facts(uid, new_facts)
 
-# ─── Запуск ───────────────────────────────────────────────────────────────────
-
-async def main():
-    global storage, mariya
-    storage = Storage(DB_PATH)
-    await storage.init()
-    mariya = Mariya(
-        anthropic_key=ANTHROPIC_API_KEY,
-        recipes_data=data,
-        model=MODEL,
-    )
-    log.info("Бот запущен")
-    await asyncio.gather(
-        dp.start_polling(bot),
-        funnel_worker(),
-        prodamus_webhook_server(),
-    )
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# ──
