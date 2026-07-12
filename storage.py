@@ -3,6 +3,7 @@ SQLite-хранилище МарИИи:
 - clients: профиль клиента (цели по КБЖУ, аллергии, нелюбимое, особенности)
 - dialog: история разговора (последние N реплик на клиента)
 - facts: авто-собранные факты о клиенте (через Haiku)
+- subscriptions: статус подписки и состояние воронки продаж
 """
 
 import json
@@ -10,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import aiosqlite
+
+_UNSET = object()  # отличаем "не передали" от явного None в upsert_subscription
 
 
 class Storage:
@@ -47,6 +50,21 @@ class Storage:
                 )""")
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_facts_user ON facts(user_id)"
+            )
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    user_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'trial',
+                    tier TEXT,
+                    paid_until TEXT,
+                    funnel_step INTEGER NOT NULL DEFAULT 0,
+                    funnel_next_at TEXT,
+                    renewal_reminder_sent INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT,
+                    updated_at TEXT
+                )""")
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_subs_funnel ON subscriptions(funnel_next_at)"
             )
             await db.commit()
 
@@ -161,3 +179,123 @@ class Storage:
             await db.execute("DELETE FROM facts WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM clients WHERE user_id = ?", (user_id,))
             await db.commit()
+
+    # ---------- Подписки / воронка ----------
+
+    _SUB_FIELDS = (
+        "user_id", "status", "tier", "paid_until",
+        "funnel_step", "funnel_next_at", "renewal_reminder_sent",
+        "created_at", "updated_at",
+    )
+    _SUB_SELECT = "SELECT " + ", ".join(_SUB_FIELDS) + " FROM subscriptions"
+
+    @classmethod
+    def _sub_row(cls, row) -> dict:
+        return dict(zip(cls._SUB_FIELDS, row))
+
+    async def get_subscription(self, user_id: str) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                f"{self._SUB_SELECT} WHERE user_id = ?", (user_id,)
+            ) as cur:
+                row = await cur.fetchone()
+        return self._sub_row(row) if row else None
+
+    async def upsert_subscription(
+        self,
+        user_id: str,
+        *,
+        status=_UNSET,
+        tier=_UNSET,
+        paid_until=_UNSET,
+        funnel_step=_UNSET,
+        funnel_next_at=_UNSET,
+        renewal_reminder_sent=_UNSET,
+    ):
+        """Частичное обновление: меняются только переданные поля.
+        Явный None допустим (например funnel_next_at=None очищает дату)."""
+        now = self._now()
+        passed = {
+            "status": status,
+            "tier": tier,
+            "paid_until": paid_until,
+            "funnel_step": funnel_step,
+            "funnel_next_at": funnel_next_at,
+            "renewal_reminder_sent": renewal_reminder_sent,
+        }
+        fields = {k: v for k, v in passed.items() if v is not _UNSET}
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT 1 FROM subscriptions WHERE user_id = ?", (user_id,)
+            ) as cur:
+                exists = await cur.fetchone()
+            if exists:
+                sets = ", ".join(f"{k} = ?" for k in fields) or "user_id = user_id"
+                await db.execute(
+                    f"UPDATE subscriptions SET {sets}, updated_at = ? WHERE user_id = ?",
+                    (*fields.values(), now, user_id),
+                )
+            else:
+                values = {
+                    "status": "trial",
+                    "tier": None,
+                    "paid_until": None,
+                    "funnel_step": 0,
+                    "funnel_next_at": None,
+                    "renewal_reminder_sent": 0,
+                }
+                values.update(fields)
+                await db.execute(
+                    """INSERT INTO subscriptions
+                       (user_id, status, tier, paid_until, funnel_step,
+                        funnel_next_at, renewal_reminder_sent, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (user_id, values["status"], values["tier"], values["paid_until"],
+                     values["funnel_step"], values["funnel_next_at"],
+                     values["renewal_reminder_sent"], now, now),
+                )
+            await db.commit()
+
+    async def set_funnel_step(self, user_id: str, step: int, next_at: str | None):
+        await self.upsert_subscription(user_id, funnel_step=step, funnel_next_at=next_at)
+
+    async def due_funnel_users(self, now_iso: str) -> list[dict]:
+        """Кому пора слать следующий шаг воронки (не оплатившие)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                f"""{self._SUB_SELECT}
+                    WHERE funnel_next_at IS NOT NULL
+                      AND funnel_next_at <= ?
+                      AND status != 'active'""",
+                (now_iso,),
+            ) as cur:
+                rows = await cur.fetchall()
+        return [self._sub_row(r) for r in rows]
+
+    async def expiring_subscriptions(self, now_iso: str, deadline_iso: str) -> list[dict]:
+        """Активные подписки, которые истекают до deadline и ещё не получали напоминание."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                f"""{self._SUB_SELECT}
+                    WHERE status = 'active'
+                      AND paid_until IS NOT NULL
+                      AND paid_until > ?
+                      AND paid_until <= ?
+                      AND renewal_reminder_sent = 0""",
+                (now_iso, deadline_iso),
+            ) as cur:
+                rows = await cur.fetchall()
+        return [self._sub_row(r) for r in rows]
+
+    async def expired_active_subscriptions(self, now_iso: str) -> list[dict]:
+        """Активные подписки с истёкшим paid_until — надо перевести в expired."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                f"""{self._SUB_SELECT}
+                    WHERE status = 'active'
+                      AND paid_until IS NOT NULL
+                      AND paid_until <= ?""",
+                (now_iso,),
+            ) as cur:
+                rows = await cur.fetchall()
+        return [self._sub_row(r) for r in rows]

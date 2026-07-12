@@ -2,7 +2,8 @@ import asyncio
 import json
 import logging
 import os
-import re
+import secrets
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction, ParseMode
@@ -12,9 +13,11 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 from aiogram.client.default import DefaultBotProperties
+from aiohttp import web
 from dotenv import load_dotenv
 
 from mariya import Mariya
+from prodamus import ProdamusClient
 from storage import Storage
 
 load_dotenv()
@@ -23,36 +26,32 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 DB_PATH = os.environ.get("DB_PATH", "mariya_data.db")
 MENU_PATH = os.environ.get("MENU_PATH", "menu.json")
-PHOTOS_DIR = os.environ.get("PHOTOS_DIR", "photos")
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID")  # для тестовой команды /testpay
+PRODAMUS_SECRET_KEY = os.environ.get("PRODAMUS_SECRET_KEY")
+PRODAMUS_SHOP_URL = os.environ.get("PRODAMUS_SHOP_URL", "https://pprecepty.payform.ru/")
+WEBHOOK_PORT = int(os.environ.get("PORT", 8080))
+# Привязываем к расположению bot.py, а не к рабочему каталогу,
+# чтобы фото находились при запуске из любого CWD
+PHOTOS_DIR = os.environ.get(
+    "PHOTOS_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "photos"),
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("recipe-bot")
 
+# ─── Загрузка меню ───────────────────────────────────────────────────────────
+
 with open(MENU_PATH, "r", encoding="utf-8") as f:
     data = json.load(f)
 
-MENU = data["menu"]  # произвольная вложенность: dict -> dict -> ... -> list[recipe_id]
+STRUCTURE = data["structure"]
+MENU = data["menu"]
 RECIPES = {r["id"]: r for r in data["recipes"]}
+CATEGORIES = list(STRUCTURE.keys())
 
-
-# ─── Навигация по дереву меню произвольной глубины ──────────────────────────
-
-def get_node(path: list[int]):
-    """Возвращает узел дерева MENU по пути индексов, и название текущего узла."""
-    node = MENU
-    label = None
-    for idx in path:
-        keys = list(node.keys())
-        label = keys[idx]
-        node = node[label]
-    return node, label
-
-def encode_path(path: list[int]) -> str:
-    return ",".join(map(str, path))
-
-def decode_path(s: str) -> list[int]:
-    return [int(x) for x in s.split(",")] if s else []
-
+# ─── Клавиатуры ──────────────────────────────────────────────────────────────
 
 def main_keyboard():
     return ReplyKeyboardMarkup(
@@ -63,60 +62,59 @@ def main_keyboard():
         resize_keyboard=True,
     )
 
-PAGE_SIZE = 8
-
-def nav_title(path: list[int], page: int = 0, total_pages: int = 1) -> str:
-    node, label = get_node(path)
-    if not path:
-        return "📂 <b>Выбери категорию:</b>"
-    if isinstance(node, dict):
-        return f"📁 <b>{label}</b>\n\nВыбери подкатегорию:"
-    page_info = f" (стр. {page + 1}/{total_pages})" if total_pages > 1 else ""
-    return f"📋 <b>{label}</b>{page_info}\n\nВыбери рецепт:"
-
-def nav_keyboard(path: list[int], page: int = 0) -> InlineKeyboardMarkup:
-    node, _ = get_node(path)
-    buttons = []
-
-    if isinstance(node, dict):
-        for i, key in enumerate(node.keys()):
-            child = node[key]
-            if isinstance(child, dict):
-                cb = f"nav:{encode_path(path + [i])}"
-            else:
-                cb = f"page:{encode_path(path + [i])}:0"
-            buttons.append([InlineKeyboardButton(text=key, callback_data=cb)])
-    elif isinstance(node, list):
-        start = page * PAGE_SIZE
-        chunk = node[start:start + PAGE_SIZE]
-        for rid in chunk:
-            if rid in RECIPES:
-                name = RECIPES[rid]["name"]
-                if len(name) > 40:
-                    name = name[:37] + "..."
-                buttons.append([InlineKeyboardButton(text=name, callback_data=f"rec:{rid}:{encode_path(path)}:{page}")])
-
-        total_pages = max(1, (len(node) - 1) // PAGE_SIZE + 1)
-        if total_pages > 1:
-            nav_row = []
-            if page > 0:
-                nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"page:{encode_path(path)}:{page - 1}"))
-            nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
-            if page < total_pages - 1:
-                nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"page:{encode_path(path)}:{page + 1}"))
-            buttons.append(nav_row)
-
-    if path:
-        back_path = path[:-1]
-        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"nav:{encode_path(back_path)}")])
-
+def categories_keyboard():
+    buttons = [
+        [InlineKeyboardButton(text=cat, callback_data=f"cat:{i}")]
+        for i, cat in enumerate(CATEGORIES)
+    ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def recipe_keyboard(path: list[int], page: int = 0) -> InlineKeyboardMarkup:
+def subcategories_keyboard(cat_idx: int):
+    cat = CATEGORIES[cat_idx]
+    subcats = STRUCTURE[cat]
+    buttons = [
+        [InlineKeyboardButton(text=sub, callback_data=f"sub:{cat_idx}:{j}")]
+        for j, sub in enumerate(subcats)
+    ]
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back:main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def recipes_keyboard(cat_idx: int, sub_idx: int):
+    cat = CATEGORIES[cat_idx]
+    sub = STRUCTURE[cat][sub_idx]
+    recipe_ids = MENU[cat][sub]
+    buttons = []
+    for rid in recipe_ids:
+        if rid in RECIPES:
+            name = RECIPES[rid]["name"]
+            if len(name) > 40:
+                name = name[:37] + "..."
+            buttons.append([InlineKeyboardButton(text=name, callback_data=f"rec:{rid}")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"back:cat:{cat_idx}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def recipe_keyboard(cat_idx: int, sub_idx: int):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад к списку", callback_data=f"page:{encode_path(path)}:{page}")]
+        [InlineKeyboardButton(text="◀️ Назад к списку", callback_data=f"back:sub:{cat_idx}:{sub_idx}")]
     ])
 
+# ─── Фото рецептов ────────────────────────────────────────────────────────────
+
+def get_photo_path(recipe_id: str) -> str | None:
+    """Путь к фото рецепта (photos/<id>.jpg) или None, если файла нет.
+    Фолбэк — поиск без учёта регистра и с другими расширениями."""
+    candidate = os.path.join(PHOTOS_DIR, f"{recipe_id}.jpg")
+    if os.path.exists(candidate):
+        return candidate
+    if os.path.isdir(PHOTOS_DIR):
+        rid = recipe_id.lower()
+        for fn in os.listdir(PHOTOS_DIR):
+            stem, ext = os.path.splitext(fn)
+            if stem.lower() == rid and ext.lower() in (".jpg", ".jpeg", ".png"):
+                return os.path.join(PHOTOS_DIR, fn)
+    return None
+
+# ─── Форматирование рецепта ───────────────────────────────────────────────────
 
 def format_recipe(recipe: dict) -> str:
     name = recipe.get("name", "")
@@ -124,52 +122,169 @@ def format_recipe(recipe: dict) -> str:
     protein = recipe.get("protein", "—")
     fat = recipe.get("fat", "—")
     carbs = recipe.get("carbs", "—")
-    portion = recipe.get("portion", "")
-
     ingredients = recipe.get("ingredients", [])
     ingredients_text = "\n".join(f"• {ing}" for ing in ingredients)
-
-    instructions = recipe.get("instructions", "").strip()
-    instructions = instructions.replace("ПРИГОТОВЛЕНИЕ", "").strip()
-
-    if "\n" not in instructions and len(instructions) > 200:
-        sentences = re.split(r'(?<=[.!?])\s+', instructions)
-        chunks = []
-        current = ""
-        for s in sentences:
-            if len(current) + len(s) > 300:
-                if current:
-                    chunks.append(current.strip())
-                current = s
-            else:
-                current += " " + s
-        if current:
-            chunks.append(current.strip())
-        instructions = "\n\n".join(chunks)
-
-    has_kcal = "kcal" in recipe
-    portion_label = {
-        "per_100g": "на 100 г",
-        "per_portion": "на порцию",
-    }.get(portion, "")
+    instructions = recipe.get("instructions", "").replace("ПРИГОТОВЛЕНИЕ", "").strip()
+    if len(instructions) > 2000:
+        instructions = instructions[:1997] + "..."
 
     text = f"<b>🍳 {name}</b>\n\n"
-    if has_kcal:
-        suffix = f" ({portion_label})" if portion_label else ""
-        text += f"📊 <b>КБЖУ{suffix}:</b>\n"
-        text += f"🔥 {kcal} ккал  |  🥩 Б: {protein}г  |  🧈 Ж: {fat}г  |  🍞 У: {carbs}г\n\n"
+    text += f"📊 <b>КБЖУ на 100г:</b>\n"
+    text += f"🔥 {kcal} ккал  |  🥩 Б: {protein}г  |  🧈 Ж: {fat}г  |  🍞 У: {carbs}г\n\n"
     text += f"🛒 <b>Ингредиенты:</b>\n{ingredients_text}\n\n"
     text += f"👨‍🍳 <b>Приготовление:</b>\n{instructions}"
-
-    if len(text) > 1000:
-        text = text[:997] + "..."
-
     return text
 
-def get_photo_path(recipe_id: str) -> str | None:
-    path = os.path.join(PHOTOS_DIR, f"{recipe_id}.jpg")
-    return path if os.path.exists(path) else None
+def find_cat_sub_for_recipe(recipe: dict):
+    cat_idx, sub_idx = 0, 0
+    cat_name = recipe.get("category", "")
+    menu_paths = recipe.get("menu_paths", [])
+    if cat_name in CATEGORIES:
+        cat_idx = CATEGORIES.index(cat_name)
+    if menu_paths:
+        parts = menu_paths[0].split("/")
+        if len(parts) > 1:
+            sub_name = parts[1]
+            cat = CATEGORIES[cat_idx]
+            subcats = STRUCTURE.get(cat, [])
+            if sub_name in subcats:
+                sub_idx = subcats.index(sub_name)
+    return cat_idx, sub_idx
 
+# ─── Воронка продаж: тексты, тарифы, клавиатуры ──────────────────────────────
+
+FUNNEL_CHECK_INTERVAL = 25          # секунд между проверками фоновой задачи
+RENEWAL_REMIND_BEFORE = 2 * 86400   # напоминать о продлении за 2 дня
+
+TIERS = {
+    "1m": {"title": "1 месяц — 1690₽", "days": 30, "price": 1690},
+    "3m": {"title": "3 месяца — 3990₽ (выгоднее на 20%)", "days": 90, "price": 3990},
+    "6m": {"title": "6 месяцев — 6990₽ (выгоднее на 30%)", "days": 180, "price": 6990},
+}
+
+WELCOME_FUNNEL_TEXT = (
+    "Привет! 💜 Это Мария — рада видеть тебя здесь.\n\n"
+    "Ты зашла в моего бота с рецептами и личным ИИ-ассистентом. "
+    "Тут собрано всё, чем я сама пользуюсь каждый день:\n\n"
+    "250+ моих фирменных ПП-рецептов и МарИИя — умный помощник, который считает КБЖУ "
+    "и собирает рационы под тебя из моего сборника рецептов\n\n"
+    "Сейчас за пару минут покажу, как это работает 👋"
+)
+
+STEP1_VIDEO_TEXT = (
+    "Смотри коротенькое видео — за 2 минуты покажу тебе всё: как искать рецепты, "
+    "как работает МарИИя и как всё это будет экономить тебе кучу времени и нервов "
+    "каждый день 👋"
+)
+
+TARIFF_CARD_TEXT = (
+    "🔥 Что ты получишь внутри бота:\n\n"
+    "🍽 250+ моих фирменных ПП-рецептов — разбиты по категориям: завтраки, мясо, "
+    "десерты и другое. Захотела — открыла — приготовила. "
+    "(рецепты будут пополняться постоянно)\n\n"
+    "🤖 МарИИя — мой личный ИИ-ассистент. Считает твоё КБЖУ по моему методу "
+    "и собирает тебе готовый рацион на день, неделю или месяц. Под твои цели, "
+    "вкусы и даже аллергии. И всё это — только из моих проверенных рецептов.\n\n"
+    "Это как иметь меня в кармане в режиме 24/7 💜\n\n"
+    "Выбирай доступ и погнали 👇"
+)
+
+DOZHIM_1_TEXT = (
+    "<b>Смотри, честно 🙈</b>\n\n"
+    "Сколько времени в день ты тратишь только на то, чтобы решить — что приготовить? "
+    "А потом ещё найти рецепт, прикинуть, впишется ли это в твое КБЖУ...\n\n"
+    "По чуть-чуть — а в сумме это часы каждую неделю. И каждый день по новой этот "
+    "мучительный вопрос: «ну что же поесть?»\n\n"
+    "А потом вообще выгорание и фраза «ну нахер эти подсчеты»\n\n"
+    "Именно чтобы закрыть это, я и сделала бота. Открыла → выбрала → приготовила. "
+    "Или попросила МарИИю собрать меню — и вообще не думаешь.\n\n"
+    "<b>Скорее забирай доступ по лучшим условиям 👇</b>"
+)
+
+DOZHIM_2_TEXT = (
+    "<b>А теперь про то, что бесит вообще всех 🤯</b>\n\n"
+    "Взвешивать каждый кусок. Заносить в приложение. Считать белки-жиры-углеводы. "
+    "Вести дневник питания, который бросаешь через 3 дня.\n\n"
+    "Знакомо? Так вот — считать больше НЕ надо. За тебя это делает МарИИя.\n\n"
+    "Пишешь ей свою цель — она сама рассчитывает твоё КБЖУ по моему методу и выдаёт "
+    "готовый рацион. Тебе остаётся только готовить и есть.\n\n"
+    "<b>Никаких весов и таблиц. Попробуешь? 👇</b>"
+)
+
+DOZHIM_3_TEXT = (
+    "<b>🔥 Один из самых частых вопросов ко мне:</b>\n\n"
+    "«Маша, я же готовлю на всю семью. Мне что, отдельно себе варить? "
+    "На это нет ни времени, ни сил.»\n\n"
+    "Понимаю как никто. Поэтому в моём боте много рецептов, которые едят все — "
+    "и муж, и дети, и ты. Вкусно и при этом в твою цель.\n\n"
+    "А если не знаешь, что выбрать — МарИИя соберёт меню, которое подойдёт и тебе, "
+    "и семье. Готовишь один раз, а не стоишь у плиты круглосуточно...."
+)
+
+PAID_TEXT = (
+    "<b>Красотка, ты в деле! 🎉 Доступ открыт.</b>\n\n"
+    "С чего советую начать:\n"
+    "1️⃣ Загляни в «Рецепты» — полистай категории, сохрани в избранное что приглянулось\n"
+    "2️⃣ Нажми «Спросить МарИИю» и попроси собрать тебе рацион на день/неделю — "
+    "просто напиши свою цель (любимые продукты, на что аллергия, свою цель и КБЖУ)\n\n"
+    "P.s. если не знаешь КБЖУ МарИИя тоже сможет рассчитать тебе его, просто напиши "
+    "свой рост/вес, цель (похудение, набор) и желаемый вес, МарИИя высчитает КБЖУ "
+    "под тебя по моей методике!\n\n"
+    "<b>Пользуйся в удовольствие. Я вложила сюда всю свою систему питания — "
+    "теперь она твоя 💫</b>"
+)
+
+# TODO: точный текст пришлёт Мария — пока нейтральная заглушка
+RENEWAL_TEXT = (
+    "⏰ Твоя подписка скоро закончится — вместе с ней закроется доступ к рецептам "
+    "и МарИИе.\n\nЧтобы ничего не потерять, продли доступ заранее 👇"
+)
+
+
+def tariffs_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=TIERS[t]["title"], callback_data=f"tier:{t}")]
+        for t in ("1m", "3m", "6m")
+    ])
+
+def pay_cta_keyboard(text: str):
+    """Одна кнопка, ведущая на карточку с тарифами."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=text, callback_data="show_tariffs")]
+    ])
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def iso_in(seconds: float) -> str:
+    return (now_utc() + timedelta(seconds=seconds)).isoformat()
+
+
+prodamus_client = ProdamusClient(PRODAMUS_SECRET_KEY or "", PRODAMUS_SHOP_URL) if PRODAMUS_SECRET_KEY else None
+
+async def generate_payment_link(user_id: str, tier: str) -> str:
+    """Генерирует ссылку на оплату Продамуса.
+    order_id кодирует user_id и tier, чтобы вебхук потом понял,
+    кому и какой тариф активировать."""
+    if not prodamus_client:
+        return "ссылка на оплату скоро тут"
+    order_id = f"{user_id}_{tier}_{secrets.token_hex(4)}"
+    data = {
+        "do": "pay",
+        "order_id": order_id,
+        "products": [
+            {
+                "name": TIERS[tier]["title"],
+                "price": TIERS[tier]["price"],
+                "quantity": 1,
+            }
+        ],
+    }
+    return prodamus_client.build_payment_link(data)
+
+
+# ─── Инициализация бота ───────────────────────────────────────────────────────
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -177,32 +292,213 @@ storage: Storage = None
 mariya: Mariya = None
 
 
-async def safe_delete(message: Message):
-    try:
-        await message.delete()
-    except Exception:
-        pass
+# ─── Воронка продаж: логика ───────────────────────────────────────────────────
 
+async def has_access(user_id: str) -> bool:
+    """Активна ли подписка. Просроченную active сразу переводит в expired."""
+    if not storage:
+        return True  # без БД пейволл не работает — не блокируем бота
+    sub = await storage.get_subscription(user_id)
+    if not sub or sub["status"] != "active":
+        return False
+    paid_until = sub.get("paid_until")
+    if paid_until and paid_until <= now_utc().isoformat():
+        await storage.upsert_subscription(user_id, status="expired")
+        return False
+    return True
+
+async def send_tariff_card(chat_id: int):
+    await bot.send_message(chat_id, TARIFF_CARD_TEXT, reply_markup=tariffs_keyboard())
+
+async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float | None]:
+    """Шлёт сообщение шага воронки. Возвращает (следующий шаг, задержка в сек)."""
+    if step == 1:
+        await bot.send_message(
+            chat_id, STEP1_VIDEO_TEXT,
+            reply_markup=pay_cta_keyboard("Перейти к оплате"),
+        )
+        return 2, 10
+    if step == 2:
+        await send_tariff_card(chat_id)
+        return 3, 30 * 60
+    if step == 3:
+        await bot.send_message(
+            chat_id, DOZHIM_1_TEXT,
+            reply_markup=pay_cta_keyboard("Получить доступ"),
+        )
+        return 4, 30 * 60
+    if step == 4:
+        await bot.send_message(
+            chat_id, DOZHIM_2_TEXT,
+            reply_markup=pay_cta_keyboard("Получить доступ к боту"),
+        )
+        return 5, 60 * 60
+    if step == 5:
+        await bot.send_message(
+            chat_id, DOZHIM_3_TEXT,
+            reply_markup=pay_cta_keyboard("Попробовать бота"),
+        )
+        return 6, None  # последний дожим — дальше не шлём
+    return None, None
+
+async def mark_paid(user_id: str, tier: str):
+    """Ветка "после оплаты": вызывается вебхуком Продамуса (и /testpay для теста).
+    Открытие доступа в БД — критическая часть и должна прокидывать исключение
+    наверх (чтобы вебхук вернул ошибку и Продамус повторил попытку).
+    Отправка уведомления пользователю — best-effort: если юзер заблокировал
+    бота, это не должно выглядеть как "оплата не прошла"."""
+    days = TIERS[tier]["days"]
+    paid_until = (now_utc() + timedelta(days=days)).isoformat()
+    await storage.upsert_subscription(
+        user_id,
+        status="active",
+        tier=tier,
+        paid_until=paid_until,
+        funnel_next_at=None,
+        renewal_reminder_sent=0,
+    )
+    log.info("Оплата: user_id=%s tier=%s до %s", user_id, tier, paid_until)
+    try:
+        await bot.send_message(int(user_id), PAID_TEXT, reply_markup=main_keyboard())
+    except Exception:
+        log.exception("Оплата прошла, но не удалось отправить уведомление user_id=%s", user_id)
+
+# ─── Вебхук Продамуса ─────────────────────────────────────────────────────────
+
+async def handle_prodamus_webhook(request: web.Request) -> web.Response:
+    raw_body = await request.text()
+    if not prodamus_client:
+        log.error("Продамус: пришёл вебхук, но PRODAMUS_SECRET_KEY не настроен")
+        return web.Response(status=500, text="not configured")
+
+    try:
+        body = prodamus_client.parse(raw_body)
+    except Exception:
+        log.exception("Продамус: не смог распарсить тело вебхука: %s", raw_body[:500])
+        return web.Response(status=400, text="bad body")
+
+    sign_header = request.headers.get("Sign", "")
+    if not prodamus_client.verify(body, sign_header):
+        log.warning("Продамус: неверная подпись вебхука, тело=%s", raw_body[:500])
+        return web.Response(status=400, text="bad signature")
+
+    order_num = body.get("order_num", "")
+    payment_status = body.get("payment_status", "")
+    parts = order_num.split("_")
+    if len(parts) < 2:
+        log.warning("Продамус: не распознал order_num=%s", order_num)
+        return web.Response(status=200, text="ignored")
+
+    user_id, tier = parts[0], parts[1]
+    log.info("Продамус webhook: order_num=%s status=%s", order_num, payment_status)
+
+    if payment_status == "success" and tier in TIERS:
+        try:
+            await mark_paid(user_id, tier)
+        except Exception:
+            log.exception("Продамус: ошибка активации user_id=%s tier=%s", user_id, tier)
+            return web.Response(status=500, text="error")
+    else:
+        log.info("Продамус webhook: статус %s не success или тариф %s неизвестен — игнор", payment_status, tier)
+
+    return web.Response(status=200, text="success")
+
+async def prodamus_webhook_server():
+    app = web.Application()
+    app.router.add_post("/prodamus/webhook", handle_prodamus_webhook)
+    app.router.add_get("/", lambda request: web.Response(text="ok"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
+    await site.start()
+    log.info("Вебхук Продамуса слушает на порту %s", WEBHOOK_PORT)
+    while True:
+        await asyncio.sleep(3600)
+
+async def funnel_tick():
+    """Один проход фоновой проверки: шаги воронки, истечение, напоминания."""
+    now_iso = now_utc().isoformat()
+
+    # 1. Кто созрел по funnel_next_at — шлём следующий шаг
+    for sub in await storage.due_funnel_users(now_iso):
+        uid = sub["user_id"]
+        try:
+            next_step, delay = await send_funnel_step(int(uid), sub["funnel_step"])
+        except Exception:
+            # юзер заблокировал бота и т.п. — останавливаем воронку, чтобы не долбить
+            log.exception("Не отправился шаг воронки user_id=%s step=%s", uid, sub["funnel_step"])
+            await storage.set_funnel_step(uid, sub["funnel_step"], None)
+            continue
+        if next_step is None:
+            await storage.set_funnel_step(uid, sub["funnel_step"], None)
+        else:
+            await storage.set_funnel_step(uid, next_step, iso_in(delay) if delay else None)
+
+    # 2. Просроченные подписки → expired
+    for sub in await storage.expired_active_subscriptions(now_iso):
+        await storage.upsert_subscription(sub["user_id"], status="expired")
+        log.info("Подписка истекла: user_id=%s", sub["user_id"])
+
+    # 3. Дожим на продление: paid_until истекает в ближайшие 2 дня
+    deadline_iso = iso_in(RENEWAL_REMIND_BEFORE)
+    for sub in await storage.expiring_subscriptions(now_iso, deadline_iso):
+        uid = sub["user_id"]
+        try:
+            await bot.send_message(
+                int(uid), RENEWAL_TEXT,
+                reply_markup=pay_cta_keyboard("Продлить подписку"),
+            )
+        except Exception:
+            log.exception("Не отправилось напоминание о продлении user_id=%s", uid)
+        # флаг ставим в любом случае, чтобы не ретраить каждый тик
+        await storage.upsert_subscription(uid, renewal_reminder_sent=1)
+
+async def funnel_worker():
+    while True:
+        try:
+            await funnel_tick()
+        except Exception:
+            log.exception("Ошибка фоновой задачи воронки")
+        await asyncio.sleep(FUNNEL_CHECK_INTERVAL)
+
+# ─── Команды ─────────────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    uid = str(message.from_user.id)
     if storage:
-        uid = str(message.from_user.id)
         name = message.from_user.first_name
         client = await storage.get_client(uid)
         if not client.get("name"):
             await storage.upsert_client(uid, name, client.get("profile", {}))
-    await message.answer(
-        "👋 Привет! Это сборник полезных рецептов.\n\n"
-        "🍽 <b>Рецепты</b> — рецепты по категориям\n"
-        "🤖 <b>Спросить МарИИю</b> — AI-нутрициолог\n\n"
-        "Выбирай 👇",
-        reply_markup=main_keyboard(),
-    )
+
+    if not storage:
+        await message.answer(WELCOME_FUNNEL_TEXT, reply_markup=main_keyboard())
+        return
+
+    sub = await storage.get_subscription(uid)
+    if sub is None:
+        # Новый юзер — запускаем воронку: шаг 1 через 5 секунд
+        await storage.upsert_subscription(uid, status="trial", funnel_step=0)
+        await message.answer(WELCOME_FUNNEL_TEXT, reply_markup=main_keyboard())
+        await storage.set_funnel_step(uid, 1, iso_in(5))
+    elif await has_access(uid):
+        await message.answer(
+            "👋 Привет! Это сборник полезных рецептов Марии Дивисенко.\n\n"
+            "🍽 <b>Рецепты</b> — просматривать 250+ рецептов по категориям\n"
+            "🤖 <b>Спросить МарИИю</b> — AI-нутрициолог: рационы, расчёт КБЖУ, советы\n\n"
+            "Выбирай что нужно 👇",
+            reply_markup=main_keyboard(),
+        )
+    else:
+        # Запись есть, но не оплачено — приветствуем и сразу показываем тарифы
+        await message.answer(WELCOME_FUNNEL_TEXT, reply_markup=main_keyboard())
+        await send_tariff_card(message.chat.id)
 
 @dp.message(Command("profile"))
 async def cmd_profile(message: Message):
     if not storage:
+        await message.answer("База данных не подключена.")
         return
     uid = str(message.from_user.id)
     client = await storage.get_client(uid)
@@ -213,6 +509,10 @@ async def cmd_profile(message: Message):
         lines.append(f"Цель: {profile['goal']}")
     if profile.get("target_kcal"):
         lines.append(f"Калории: {profile['target_kcal']} ккал/день")
+    if profile.get("allergies"):
+        lines.append(f"Аллергии: {', '.join(profile['allergies'])}")
+    if profile.get("dislikes"):
+        lines.append(f"Не ест: {', '.join(profile['dislikes'])}")
     if facts:
         lines.append("\n📝 <b>Что я помню:</b>")
         for f in facts[:10]:
@@ -225,90 +525,195 @@ async def cmd_profile(message: Message):
 async def cmd_forget(message: Message):
     if storage:
         await storage.clear_dialog(str(message.from_user.id))
-    await message.answer("История диалога очищена.")
+    await message.answer("История диалога очищена. Факты о тебе сохранены.")
 
 @dp.message(Command("reset"))
 async def cmd_reset(message: Message):
     if storage:
         await storage.full_reset(str(message.from_user.id))
-    await message.answer("Полный сброс выполнен.")
+    await message.answer("Полный сброс. Начинаем с чистого листа.")
 
+# ─── Воронка: колбэки и тестовая оплата ──────────────────────────────────────
+
+@dp.callback_query(F.data == "show_tariffs")
+async def cb_show_tariffs(callback: CallbackQuery):
+    await send_tariff_card(callback.message.chat.id)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("tier:"))
+async def cb_choose_tier(callback: CallbackQuery):
+    tier = callback.data.split(":")[1]
+    if tier not in TIERS:
+        await callback.answer("Неизвестный тариф")
+        return
+    uid = str(callback.from_user.id)
+    link = await generate_payment_link(uid, tier)
+    title = TIERS[tier]["title"]
+    if link.startswith("http"):
+        # Когда подключим Продамус — ссылка станет настоящей и уйдёт кнопкой
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатить", url=link)]
+        ])
+        await callback.message.answer(f"Оплата: <b>{title}</b> 👇", reply_markup=kb)
+    else:
+        await callback.message.answer(f"💳 <b>{title}</b>\n\n{link}")
+    await callback.answer()
+
+@dp.message(Command("testpay"))
+async def cmd_testpay(message: Message):
+    """Тестовая заглушка оплаты: /testpay 1m|3m|6m. Только для админа.
+    Будет удалена после подключения вебхука Продамуса."""
+    if not storage:
+        return
+    if not ADMIN_USER_ID or str(message.from_user.id) != ADMIN_USER_ID:
+        return
+    parts = message.text.split()
+    tier = parts[1] if len(parts) > 1 else "1m"
+    if tier not in TIERS:
+        await message.answer("Тариф: 1m, 3m или 6m")
+        return
+    await mark_paid(str(message.from_user.id), tier)
+
+# ─── Меню рецептов ────────────────────────────────────────────────────────────
 
 @dp.message(F.text == "🍽 Рецепты")
 async def show_categories(message: Message):
-    await message.answer(nav_title([]), reply_markup=nav_keyboard([]))
+    if not await has_access(str(message.from_user.id)):
+        await send_tariff_card(message.chat.id)
+        return
+    await message.answer("📂 <b>Выбери категорию:</b>", reply_markup=categories_keyboard())
 
-@dp.callback_query(F.data.startswith("nav:"))
-async def navigate(callback: CallbackQuery):
-    path = decode_path(callback.data[4:])
-    await safe_delete(callback.message)
-    await callback.message.answer(nav_title(path), reply_markup=nav_keyboard(path))
+@dp.callback_query(F.data.startswith("cat:"))
+async def show_subcategories(callback: CallbackQuery):
+    if not await has_access(str(callback.from_user.id)):
+        await callback.answer()
+        await send_tariff_card(callback.message.chat.id)
+        return
+    cat_idx = int(callback.data.split(":")[1])
+    cat = CATEGORIES[cat_idx]
+    await callback.message.edit_text(
+        f"📁 <b>{cat}</b>\n\nВыбери подкатегорию:",
+        reply_markup=subcategories_keyboard(cat_idx),
+    )
     await callback.answer()
 
-@dp.callback_query(F.data == "noop")
-async def noop(callback: CallbackQuery):
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("page:"))
-async def navigate_page(callback: CallbackQuery):
-    rest = callback.data[5:]
-    path_str, page_str = rest.rsplit(":", 1)
-    path = decode_path(path_str)
-    page = int(page_str)
-    node, _ = get_node(path)
-    total_pages = max(1, (len(node) - 1) // PAGE_SIZE + 1) if isinstance(node, list) else 1
-    await safe_delete(callback.message)
-    await callback.message.answer(
-        nav_title(path, page, total_pages),
-        reply_markup=nav_keyboard(path, page),
+@dp.callback_query(F.data.startswith("sub:"))
+async def show_recipes(callback: CallbackQuery):
+    if not await has_access(str(callback.from_user.id)):
+        await callback.answer()
+        await send_tariff_card(callback.message.chat.id)
+        return
+    _, cat_idx, sub_idx = callback.data.split(":")
+    cat_idx, sub_idx = int(cat_idx), int(sub_idx)
+    cat = CATEGORIES[cat_idx]
+    sub = STRUCTURE[cat][sub_idx]
+    await callback.message.edit_text(
+        f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
+        reply_markup=recipes_keyboard(cat_idx, sub_idx),
     )
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("rec:"))
 async def show_recipe(callback: CallbackQuery):
-    rest = callback.data[4:]
-    parts = rest.split(":")
-    recipe_id = parts[0]
-    page = int(parts[-1])
-    path = decode_path(":".join(parts[1:-1]))
-
+    if not await has_access(str(callback.from_user.id)):
+        await callback.answer()
+        await send_tariff_card(callback.message.chat.id)
+        return
+    recipe_id = callback.data[4:]
     recipe = RECIPES.get(recipe_id)
     if not recipe:
         await callback.answer("Рецепт не найден")
         return
-
+    cat_idx, sub_idx = find_cat_sub_for_recipe(recipe)
     text = format_recipe(recipe)
-    keyboard = recipe_keyboard(path, page)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
     photo_path = get_photo_path(recipe_id)
-
-    await safe_delete(callback.message)
-
+    log.info(
+        "Фото рецепта %s: PHOTOS_DIR=%s путь=%s exists=%s",
+        recipe_id, PHOTOS_DIR,
+        photo_path or os.path.join(PHOTOS_DIR, f"{recipe_id}.jpg"),
+        bool(photo_path and os.path.exists(photo_path)),
+    )
+    photo_sent_with_caption = False
     if photo_path:
-        await callback.message.answer_photo(
-            photo=FSInputFile(photo_path),
-            caption=text,
-            reply_markup=keyboard,
-            protect_content=True,
-        )
-    else:
+        try:
+            if len(text) <= 1024:
+                # влезает в лимит подписи Telegram — шлём одним сообщением
+                await callback.message.answer_photo(
+                    FSInputFile(photo_path),
+                    caption=text,
+                    reply_markup=recipe_keyboard(cat_idx, sub_idx),
+                    protect_content=True,
+                )
+                photo_sent_with_caption = True
+            else:
+                await callback.message.answer_photo(
+                    FSInputFile(photo_path),
+                    protect_content=True,
+                )
+        except Exception:
+            # не глотаем молча: фото не ушло — логируем и шлём хотя бы текст
+            log.exception("Не удалось отправить фото %s (%s)", recipe_id, photo_path)
+
+    if not photo_sent_with_caption:
         await callback.message.answer(
             text,
-            reply_markup=keyboard,
+            reply_markup=recipe_keyboard(cat_idx, sub_idx),
             protect_content=True,
         )
     await callback.answer()
 
+@dp.callback_query(F.data.startswith("back:"))
+async def handle_back(callback: CallbackQuery):
+    if not await has_access(str(callback.from_user.id)):
+        await callback.answer()
+        await send_tariff_card(callback.message.chat.id)
+        return
+    parts = callback.data.split(":")
+    if parts[1] == "main":
+        await callback.message.edit_text("📂 <b>Выбери категорию:</b>", reply_markup=categories_keyboard())
+    elif parts[1] == "cat":
+        cat_idx = int(parts[2])
+        cat = CATEGORIES[cat_idx]
+        await callback.message.edit_text(
+            f"📁 <b>{cat}</b>\n\nВыбери подкатегорию:",
+            reply_markup=subcategories_keyboard(cat_idx),
+        )
+    elif parts[1] == "sub":
+        cat_idx, sub_idx = int(parts[2]), int(parts[3])
+        cat = CATEGORIES[cat_idx]
+        sub = STRUCTURE[cat][sub_idx]
+        try:
+            await callback.message.edit_text(
+                f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
+                reply_markup=recipes_keyboard(cat_idx, sub_idx),
+            )
+        except Exception:
+            await callback.message.answer(
+                f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
+                reply_markup=recipes_keyboard(cat_idx, sub_idx),
+            )
+    await callback.answer()
+
+# ─── МарИИя ───────────────────────────────────────────────────────────────────
 
 @dp.message(F.text == "🤖 Спросить МарИИю")
 async def mariya_intro(message: Message):
+    if not await has_access(str(message.from_user.id)):
+        await send_tariff_card(message.chat.id)
+        return
     await message.answer(
         "🤖 <b>МарИИя — AI-нутрициолог</b>\n\n"
         "Я помогу:\n"
         "• Посчитать твою норму КБЖУ\n"
-        "• Составить рацион по целям\n"
-        "• Подобрать рецепты под аллергии\n\n"
-        "Просто напиши что нужно 👇\n\n"
-        "<i>/profile — профиль | /forget — очистить диалог</i>"
+        "• Составить рацион по твоим целям\n"
+        "• Подобрать рецепты под аллергии и предпочтения\n\n"
+        "Просто напиши что тебе нужно 👇\n\n"
+        "<i>Команды: /profile — профиль | /forget — очистить диалог | /reset — полный сброс</i>"
     )
 
 @dp.message(F.text)
@@ -318,6 +723,11 @@ async def handle_text(message: Message):
         return
 
     uid = str(message.from_user.id)
+
+    if not await has_access(uid):
+        await send_tariff_card(message.chat.id)
+        return
+
     user_text = message.text.strip()
 
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
@@ -332,11 +742,13 @@ async def handle_text(message: Message):
 
     await message.answer(reply, parse_mode=None)
 
+    # Фоновое обучение
     existing_facts = [f["text"] for f in client.get("facts", [])]
     new_facts = await mariya.extract_facts(user_text, reply, existing_facts)
     if new_facts:
         await storage.add_facts(uid, new_facts)
 
+# ─── Запуск ───────────────────────────────────────────────────────────────────
 
 async def main():
     global storage, mariya
@@ -345,10 +757,14 @@ async def main():
     mariya = Mariya(
         anthropic_key=ANTHROPIC_API_KEY,
         recipes_data=data,
-        model=os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"),
+        model=MODEL,
     )
     log.info("Бот запущен")
-    await dp.start_polling(bot)
+    await asyncio.gather(
+        dp.start_polling(bot),
+        funnel_worker(),
+        prodamus_webhook_server(),
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
