@@ -794,4 +794,39 @@ async def handle_text(message: Message):
 
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    client = await storage.get
+    client = await storage.get_client(uid)
+    history = await storage.get_dialog(uid, limit=40)
+
+    reply = await mariya.chat(user_text, client, history)
+
+    await storage.add_dialog(uid, "user", user_text)
+    await storage.add_dialog(uid, "assistant", reply)
+
+    await message.answer(reply, parse_mode=None)
+
+    # Фоновое обучение
+    existing_facts = [f["text"] for f in client.get("facts", [])]
+    new_facts = await mariya.extract_facts(user_text, reply, existing_facts)
+    if new_facts:
+        await storage.add_facts(uid, new_facts)
+
+# ─── Запуск ───────────────────────────────────────────────────────────────────
+
+async def main():
+    global storage, mariya
+    storage = Storage(DB_PATH)
+    await storage.init()
+    mariya = Mariya(
+        anthropic_key=ANTHROPIC_API_KEY,
+        recipes_data=data,
+        model=MODEL,
+    )
+    log.info("Бот запущен")
+    await asyncio.gather(
+        run_polling_safe(),
+        funnel_worker(),
+        prodamus_webhook_server(),
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())
