@@ -288,6 +288,8 @@ async def generate_payment_link(user_id: str, tier: str) -> str:
     if PRODAMUS_DEMO_MODE:
         data["demo_mode"] = 1
         log.warning("Продамус: ссылка сгенерирована в ДЕМО-режиме (PRODAMUS_DEMO_MODE=1)")
+    _diag["last_payment_link_order_id"] = order_id
+    _diag["prodamus_demo_mode"] = PRODAMUS_DEMO_MODE
     return prodamus_client.build_payment_link(data)
 
 
@@ -298,13 +300,21 @@ dp = Dispatcher()
 storage: Storage = None
 mariya: Mariya = None
 
-# ─── Диагностика поллинга (временно, чтобы обойти проблему с логами Railway) ──
+# ─── Диагностика поллинга и вебхука (временно, чтобы обойти проблему с логами Railway) ──
 _diag = {
     "polling_attempts": 0,
     "last_error": None,
     "last_error_at": None,
     "last_started_at": None,
     "bot_token_prefix": BOT_TOKEN.split(":")[0] if BOT_TOKEN else None,
+    "prodamus_demo_mode": None,  # выставится после чтения PRODAMUS_DEMO_MODE ниже
+    "last_webhook_at": None,
+    "last_webhook_raw": None,
+    "last_webhook_sig_valid": None,
+    "last_webhook_order_num": None,
+    "last_webhook_status": None,
+    "last_webhook_result": None,
+    "last_payment_link_order_id": None,
 }
 
 
@@ -383,26 +393,36 @@ async def mark_paid(user_id: str, tier: str):
 
 async def handle_prodamus_webhook(request: web.Request) -> web.Response:
     raw_body = await request.text()
+    _diag["last_webhook_at"] = datetime.now(timezone.utc).isoformat()
+    _diag["last_webhook_raw"] = raw_body[:1000]
     if not prodamus_client:
         log.error("Продамус: пришёл вебхук, но PRODAMUS_SECRET_KEY не настроен")
+        _diag["last_webhook_result"] = "not configured"
         return web.Response(status=500, text="not configured")
 
     try:
         body = prodamus_client.parse(raw_body)
     except Exception:
         log.exception("Продамус: не смог распарсить тело вебхука: %s", raw_body[:500])
+        _diag["last_webhook_result"] = "bad body"
         return web.Response(status=400, text="bad body")
 
     sign_header = request.headers.get("Sign", "")
-    if not prodamus_client.verify(body, sign_header):
+    sig_valid = prodamus_client.verify(body, sign_header)
+    _diag["last_webhook_sig_valid"] = sig_valid
+    if not sig_valid:
         log.warning("Продамус: неверная подпись вебхука, тело=%s", raw_body[:500])
+        _diag["last_webhook_result"] = "bad signature"
         return web.Response(status=400, text="bad signature")
 
     order_num = body.get("order_num", "")
     payment_status = body.get("payment_status", "")
+    _diag["last_webhook_order_num"] = order_num
+    _diag["last_webhook_status"] = payment_status
     parts = order_num.split("_")
     if len(parts) < 2:
         log.warning("Продамус: не распознал order_num=%s", order_num)
+        _diag["last_webhook_result"] = "unrecognized order_num"
         return web.Response(status=200, text="ignored")
 
     user_id, tier = parts[0], parts[1]
@@ -411,11 +431,14 @@ async def handle_prodamus_webhook(request: web.Request) -> web.Response:
     if payment_status == "success" and tier in TIERS:
         try:
             await mark_paid(user_id, tier)
-        except Exception:
+            _diag["last_webhook_result"] = "mark_paid ok"
+        except Exception as e:
             log.exception("Продамус: ошибка активации user_id=%s tier=%s", user_id, tier)
+            _diag["last_webhook_result"] = f"mark_paid error: {e}"
             return web.Response(status=500, text="error")
     else:
         log.info("Продамус webhook: статус %s не success или тариф %s неизвестен — игнор", payment_status, tier)
+        _diag["last_webhook_result"] = f"ignored (status={payment_status})"
 
     return web.Response(status=200, text="success")
 
@@ -771,39 +794,4 @@ async def handle_text(message: Message):
 
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    client = await storage.get_client(uid)
-    history = await storage.get_dialog(uid, limit=40)
-
-    reply = await mariya.chat(user_text, client, history)
-
-    await storage.add_dialog(uid, "user", user_text)
-    await storage.add_dialog(uid, "assistant", reply)
-
-    await message.answer(reply, parse_mode=None)
-
-    # Фоновое обучение
-    existing_facts = [f["text"] for f in client.get("facts", [])]
-    new_facts = await mariya.extract_facts(user_text, reply, existing_facts)
-    if new_facts:
-        await storage.add_facts(uid, new_facts)
-
-# ─── Запуск ───────────────────────────────────────────────────────────────────
-
-async def main():
-    global storage, mariya
-    storage = Storage(DB_PATH)
-    await storage.init()
-    mariya = Mariya(
-        anthropic_key=ANTHROPIC_API_KEY,
-        recipes_data=data,
-        model=MODEL,
-    )
-    log.info("Бот запущен")
-    await asyncio.gather(
-        run_polling_safe(),
-        funnel_worker(),
-        prodamus_webhook_server(),
-    )
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    client = await storage.get
