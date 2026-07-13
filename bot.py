@@ -447,7 +447,13 @@ async def handle_prodamus_webhook(request: web.Request) -> web.Response:
     return web.Response(status=200, text="success")
 
 async def handle_debug(request: web.Request) -> web.Response:
+    # Защита: без правильного ключа отдаём 404 (не 403 — чтобы не палить сам факт
+    # существования эндпоинта). Ключ = последние 8 символов PRODAMUS_SECRET_KEY,
+    # так что не нужно заводить отдельную переменную окружения на Railway.
     import json as _json
+    expected_key = (PRODAMUS_SECRET_KEY or "")[-8:]
+    if not expected_key or request.query.get("key") != expected_key:
+        return web.Response(status=404, text="not found")
     return web.Response(
         status=200,
         content_type="application/json",
