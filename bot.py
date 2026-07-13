@@ -335,6 +335,19 @@ async def has_access(user_id: str) -> bool:
         return False
     return True
 
+async def send_welcome(chat_id: int):
+    """Приветственное сообщение — первое, что видит юзер. Если есть фото-обложка
+    (photos/step1_intro.jpg), крепим его сюда с подписью вместо отдельного фото
+    и отдельного текста."""
+    welcome_photo = os.path.join(PHOTOS_DIR, "step1_intro.jpg")
+    if os.path.exists(welcome_photo):
+        await bot.send_photo(
+            chat_id, FSInputFile(welcome_photo),
+            caption=WELCOME_FUNNEL_TEXT, reply_markup=main_keyboard(),
+        )
+    else:
+        await bot.send_message(chat_id, WELCOME_FUNNEL_TEXT, reply_markup=main_keyboard())
+
 async def send_tariff_card(chat_id: int):
     tariff_photo = os.path.join(PHOTOS_DIR, "tariff_card.png")
     if os.path.exists(tariff_photo):
@@ -348,12 +361,10 @@ async def send_tariff_card(chat_id: int):
 async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float | None]:
     """Шлёт сообщение шага воронки. Возвращает (следующий шаг, задержка в сек)."""
     if step == 1:
-        step1_photo = os.path.join(PHOTOS_DIR, "step1_intro.jpg")
-        kb = pay_cta_keyboard("Перейти к оплате")
-        if os.path.exists(step1_photo):
-            await bot.send_photo(chat_id, FSInputFile(step1_photo), caption=STEP1_VIDEO_TEXT, reply_markup=kb)
-        else:
-            await bot.send_message(chat_id, STEP1_VIDEO_TEXT, reply_markup=kb)
+        await bot.send_message(
+            chat_id, STEP1_VIDEO_TEXT,
+            reply_markup=pay_cta_keyboard("Перейти к оплате"),
+        )
         return 2, 10
     if step == 2:
         await send_tariff_card(chat_id)
@@ -562,14 +573,14 @@ async def cmd_start(message: Message):
             await storage.upsert_client(uid, name, client.get("profile", {}))
 
     if not storage:
-        await message.answer(WELCOME_FUNNEL_TEXT, reply_markup=main_keyboard())
+        await send_welcome(message.chat.id)
         return
 
     sub = await storage.get_subscription(uid)
     if sub is None:
         # Новый юзер — запускаем воронку: шаг 1 через 5 секунд
         await storage.upsert_subscription(uid, status="trial", funnel_step=0)
-        await message.answer(WELCOME_FUNNEL_TEXT, reply_markup=main_keyboard())
+        await send_welcome(message.chat.id)
         await storage.set_funnel_step(uid, 1, iso_in(5))
     elif await has_access(uid):
         await message.answer(
@@ -581,7 +592,7 @@ async def cmd_start(message: Message):
         )
     else:
         # Запись есть, но не оплачено — приветствуем и сразу показываем тарифы
-        await message.answer(WELCOME_FUNNEL_TEXT, reply_markup=main_keyboard())
+        await send_welcome(message.chat.id)
         await send_tariff_card(message.chat.id)
 
 @dp.message(Command("profile"))
