@@ -311,6 +311,8 @@ _diag = {
     "last_webhook_at": None,
     "last_webhook_raw": None,
     "last_webhook_sig_valid": None,
+    "last_webhook_sign_header": None,
+    "last_webhook_expected_sig": None,
     "last_webhook_order_num": None,
     "last_webhook_status": None,
     "last_webhook_result": None,
@@ -410,6 +412,8 @@ async def handle_prodamus_webhook(request: web.Request) -> web.Response:
     sign_header = request.headers.get("Sign", "")
     sig_valid = prodamus_client.verify(body, sign_header)
     _diag["last_webhook_sig_valid"] = sig_valid
+    _diag["last_webhook_sign_header"] = sign_header
+    _diag["last_webhook_expected_sig"] = prodamus_client.sign(body)
     if not sig_valid:
         log.warning("Продамус: неверная подпись вебхука, тело=%s", raw_body[:500])
         _diag["last_webhook_result"] = "bad signature"
