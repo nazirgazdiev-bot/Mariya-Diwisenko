@@ -298,6 +298,15 @@ dp = Dispatcher()
 storage: Storage = None
 mariya: Mariya = None
 
+# ─── Диагностика поллинга (временно, чтобы обойти проблему с логами Railway) ──
+_diag = {
+    "polling_attempts": 0,
+    "last_error": None,
+    "last_error_at": None,
+    "last_started_at": None,
+    "bot_token_prefix": BOT_TOKEN.split(":")[0] if BOT_TOKEN else None,
+}
+
 
 # ─── Воронка продаж: логика ───────────────────────────────────────────────────
 
@@ -410,10 +419,33 @@ async def handle_prodamus_webhook(request: web.Request) -> web.Response:
 
     return web.Response(status=200, text="success")
 
+async def handle_debug(request: web.Request) -> web.Response:
+    import json as _json
+    return web.Response(
+        status=200,
+        content_type="application/json",
+        text=_json.dumps(_diag, ensure_ascii=False, default=str),
+    )
+
+async def run_polling_safe():
+    """Обёртка над dp.start_polling: ловит и запоминает любую ошибку,
+    чтобы её можно было увидеть через /debug (логи Railway сейчас не видны)."""
+    while True:
+        _diag["polling_attempts"] += 1
+        _diag["last_started_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            await dp.start_polling(bot)
+        except Exception as e:
+            _diag["last_error"] = f"{type(e).__name__}: {e}"
+            _diag["last_error_at"] = datetime.now(timezone.utc).isoformat()
+            log.exception("Поллинг упал, перезапуск через 5с")
+            await asyncio.sleep(5)
+
 async def prodamus_webhook_server():
     app = web.Application()
     app.router.add_post("/prodamus/webhook", handle_prodamus_webhook)
     app.router.add_get("/", lambda request: web.Response(text="ok"))
+    app.router.add_get("/debug", handle_debug)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
@@ -755,4 +787,23 @@ async def handle_text(message: Message):
     if new_facts:
         await storage.add_facts(uid, new_facts)
 
-# ──
+# ─── Запуск ───────────────────────────────────────────────────────────────────
+
+async def main():
+    global storage, mariya
+    storage = Storage(DB_PATH)
+    await storage.init()
+    mariya = Mariya(
+        anthropic_key=ANTHROPIC_API_KEY,
+        recipes_data=data,
+        model=MODEL,
+    )
+    log.info("Бот запущен")
+    await asyncio.gather(
+        run_polling_safe(),
+        funnel_worker(),
+        prodamus_webhook_server(),
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())
