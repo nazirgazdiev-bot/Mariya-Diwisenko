@@ -10,7 +10,7 @@ from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, Message, ReplyKeyboardMarkup,
+    InputMediaPhoto, KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiohttp import web
@@ -221,6 +221,19 @@ DOZHIM_3_TEXT = (
     "и семье. Готовишь один раз, а не стоишь у плиты круглосуточно...."
 )
 
+DOZHIM_4_TEXT = (
+    "<b>Давай честно про деньги 💬</b>\n\n"
+    "Знаю, что многих останавливает мысль: «а вдруг куплю и не буду пользоваться, "
+    "как с теми марафонами».\n\n"
+    "Я тебя понимаю. Поэтому скажу прямо: это не курс, который надо проходить, "
+    "и не марафон, где нужно успевать. Это инструмент, который просто всегда под рукой.\n\n"
+    "Захотела рецепт — открыла. Нужно меню — спросила МарИИю. Никаких дедлайнов "
+    "и чувства вины, что ты что-то не успела.\n\n"
+    "1690 ₽ в месяц — это меньше, чем ты тратишь на спонтанные продукты, которые "
+    "покупаешь, не зная что готовить, и которые потом портятся в холодильнике.\n\n"
+    "<b>Попробуй, не понравится — верну деньги 👇</b>"
+)
+
 PAID_TEXT = (
     "<b>Красотка, ты в деле! 🎉 Доступ открыт.</b>\n\n"
     "С чего советую начать:\n"
@@ -378,6 +391,16 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
             await bot.send_message(chat_id, DOZHIM_1_TEXT, reply_markup=kb)
         return 4, 30 * 60
     if step == 4:
+        demo_photo = os.path.join(PHOTOS_DIR, "dozhim2_demo.png")
+        testimonial_photo = os.path.join(PHOTOS_DIR, "dozhim2_testimonial.png")
+        media = [
+            InputMediaPhoto(media=FSInputFile(p))
+            for p in (demo_photo, testimonial_photo) if os.path.exists(p)
+        ]
+        if media:
+            # У медиагруппы в Telegram нельзя прикрепить inline-кнопку —
+            # поэтому шлём картинки альбомом, а текст с кнопкой отдельным сообщением следом
+            await bot.send_media_group(chat_id, media)
         await bot.send_message(
             chat_id, DOZHIM_2_TEXT,
             reply_markup=pay_cta_keyboard("Получить доступ к боту"),
@@ -390,7 +413,15 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
             await bot.send_photo(chat_id, FSInputFile(dozhim3_photo), caption=DOZHIM_3_TEXT, reply_markup=kb)
         else:
             await bot.send_message(chat_id, DOZHIM_3_TEXT, reply_markup=kb)
-        return 6, None  # последний дожим — дальше не шлём
+        return 6, 24 * 60 * 60  # ещё один дожим (про деньги) через сутки
+    if step == 6:
+        price_photo = os.path.join(PHOTOS_DIR, "dozhim4_price.png")
+        kb = pay_cta_keyboard("Забрать доступ")
+        if os.path.exists(price_photo):
+            await bot.send_photo(chat_id, FSInputFile(price_photo), caption=DOZHIM_4_TEXT, reply_markup=kb)
+        else:
+            await bot.send_message(chat_id, DOZHIM_4_TEXT, reply_markup=kb)
+        return 7, None  # последний дожим — дальше не шлём
     return None, None
 
 async def mark_paid(user_id: str, tier: str):
