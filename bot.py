@@ -350,6 +350,9 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
         await send_tariff_card(chat_id)
         return 3, 30 * 60
     if step == 3:
+        dozhim1_photo = os.path.join(PHOTOS_DIR, "dozhim1.jpg")
+        if os.path.exists(dozhim1_photo):
+            await bot.send_photo(chat_id, FSInputFile(dozhim1_photo))
         await bot.send_message(
             chat_id, DOZHIM_1_TEXT,
             reply_markup=pay_cta_keyboard("Получить доступ"),
