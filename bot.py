@@ -336,11 +336,17 @@ async def has_access(user_id: str) -> bool:
     return True
 
 async def send_tariff_card(chat_id: int):
+    tariff_photo = os.path.join(PHOTOS_DIR, "tariff_card.png")
+    if os.path.exists(tariff_photo):
+        await bot.send_photo(chat_id, FSInputFile(tariff_photo))
     await bot.send_message(chat_id, TARIFF_CARD_TEXT, reply_markup=tariffs_keyboard())
 
 async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float | None]:
     """Шлёт сообщение шага воронки. Возвращает (следующий шаг, задержка в сек)."""
     if step == 1:
+        step1_photo = os.path.join(PHOTOS_DIR, "step1_intro.jpg")
+        if os.path.exists(step1_photo):
+            await bot.send_photo(chat_id, FSInputFile(step1_photo))
         await bot.send_message(
             chat_id, STEP1_VIDEO_TEXT,
             reply_markup=pay_cta_keyboard("Перейти к оплате"),
@@ -365,6 +371,9 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
         )
         return 5, 60 * 60
     if step == 5:
+        dozhim3_photo = os.path.join(PHOTOS_DIR, "dozhim3.jpg")
+        if os.path.exists(dozhim3_photo):
+            await bot.send_photo(chat_id, FSInputFile(dozhim3_photo))
         await bot.send_message(
             chat_id, DOZHIM_3_TEXT,
             reply_markup=pay_cta_keyboard("Попробовать бота"),
@@ -390,6 +399,9 @@ async def mark_paid(user_id: str, tier: str):
     )
     log.info("Оплата: user_id=%s tier=%s до %s", user_id, tier, paid_until)
     try:
+        paid_photo = os.path.join(PHOTOS_DIR, "paid.png")
+        if os.path.exists(paid_photo):
+            await bot.send_photo(int(user_id), FSInputFile(paid_photo))
         await bot.send_message(int(user_id), PAID_TEXT, reply_markup=main_keyboard())
     except Exception:
         log.exception("Оплата прошла, но не удалось отправить уведомление user_id=%s", user_id)
