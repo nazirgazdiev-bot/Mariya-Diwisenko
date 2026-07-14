@@ -10,7 +10,7 @@ from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputMediaPhoto, KeyboardButton, Message, ReplyKeyboardMarkup,
+    KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiohttp import web
@@ -234,6 +234,36 @@ DOZHIM_4_TEXT = (
     "<b>Попробуй, не понравится — верну деньги 👇</b>"
 )
 
+DOZHIM_5_TEXT = (
+    "Знаю, о чём некоторые думают:\n\n"
+    "«да этот бот выдаст мне овсянку на воде, которую я есть не буду» 😄\n\n"
+    "Расслабься — МарИИя гибкая.\n\n"
+    "Не любишь рыбу? Скажи — заменит. Аллергия на молочку? Учтёт. "
+    "Хочешь сегодня что-то сладкое на завтрак? Впишет.\n\n"
+    "Ты говоришь, что любишь и что не хочешь — а она подстраивает меню под ТЕБЯ. "
+    "Мой бот — это не жёсткий план из которого хочется сбежать и сорваться. "
+    "Это питание под твои желания.\n\n"
+    "<b>Проверь сама по самым лучшим условиям сейчас 👇</b>"
+)
+
+DOZHIM_6_TEXT = (
+    "<b>Пока ты думаешь — девочки уже вовсю готовят по боту 👆</b>\n\n"
+    "Самое приятное для меня — что многие пишут одно и то же: «наконец-то я "
+    "перестала мучиться вопросом что приготовить, а вес начал уходить».\n\n"
+    "Ровно для этого всё и создавалось!\n\n"
+    "<b>Присоединяйся к нам, и готовь без гемора 😅</b>"
+)
+
+DOZHIM_7_TEXT = (
+    "<b>Последнее напоминание от меня 💔</b>\n\n"
+    "Если ты дочитала до сюда — значит, тема питания тебя правда волнует. "
+    "И ты уже устала от этого хаоса: то диета, то срыв, то «с понедельника».\n\n"
+    "Бот — это способ навести порядок в еде раз и навсегда. Без весов, без "
+    "мучений, без «что приготовить». Всё уже собрано и продумано за тебя.\n\n"
+    "Сегодня — напоминаю про вступление последний раз, далее бот отключается 💔\n\n"
+    "<b>Погнали кушать вкусно и легко 👇</b>"
+)
+
 PAID_TEXT = (
     "<b>Красотка, ты в деле! 🎉 Доступ открыт.</b>\n\n"
     "С чего советую начать:\n"
@@ -272,6 +302,21 @@ def now_utc() -> datetime:
 
 def iso_in(seconds: float) -> str:
     return (now_utc() + timedelta(seconds=seconds)).isoformat()
+
+MSK = timezone(timedelta(hours=3))
+
+def seconds_until_msk(days_ahead: int, hour: int, minute: int = 0) -> float:
+    """Секунд от текущего момента до `hour:minute` по МСК через `days_ahead`
+    календарных дней (от сегодняшней даты по МСК). Нужно для гибридной
+    относительно-абсолютной схемы дожимов из Miro (день N в HH:MM МСК),
+    которая идёт после первых трёх дожимов на чистых относительных задержках."""
+    now_msk = now_utc().astimezone(MSK)
+    target_date = (now_msk + timedelta(days=days_ahead)).date()
+    target = datetime(
+        target_date.year, target_date.month, target_date.day,
+        hour, minute, tzinfo=MSK,
+    )
+    return max((target - now_msk).total_seconds(), 60.0)
 
 
 prodamus_client = ProdamusClient(PRODAMUS_SECRET_KEY or "", PRODAMUS_SHOP_URL) if PRODAMUS_SECRET_KEY else None
@@ -376,16 +421,22 @@ async def send_tariff_card(chat_id: int):
         await bot.send_message(chat_id, TARIFF_CARD_TEXT, reply_markup=tariffs_keyboard())
 
 async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float | None]:
-    """Шлёт сообщение шага воронки. Возвращает (следующий шаг, задержка в сек)."""
+    """Шлёт сообщение шага воронки. Возвращает (следующий шаг, задержка в сек).
+
+    Схема сверена вручную с Miro-доской 2026-07-14 (не по памяти/скриншотам,
+    а через accessibility-дерево доски — так надёжнее). Первые три дожима идут
+    на чистых относительных задержках от заявки (30 мин / 1 час / 2 часа),
+    дальше — гибридная схема с абсолютными день-N-в-HH:MM МСК таймкодами
+    (см. seconds_until_msk)."""
     if step == 1:
         await bot.send_message(
             chat_id, STEP1_VIDEO_TEXT,
             reply_markup=pay_cta_keyboard("Перейти к оплате"),
         )
-        return 2, 10
+        return 2, 15  # тариф-карта — ЧЕРЕЗ 15 СЕКУНД
     if step == 2:
         await send_tariff_card(chat_id)
-        return 3, 15  # TEMP: было 30*60, ускорено для диагностики
+        return 3, 30 * 60  # дожим 1 — через 30 минут после заявки
     if step == 3:
         dozhim1_photo = os.path.join(PHOTOS_DIR, "dozhim1.jpg")
         kb = pay_cta_keyboard("Получить доступ")
@@ -393,23 +444,14 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
             await bot.send_photo(chat_id, FSInputFile(dozhim1_photo), caption=DOZHIM_1_TEXT, reply_markup=kb)
         else:
             await bot.send_message(chat_id, DOZHIM_1_TEXT, reply_markup=kb)
-        return 4, 15  # TEMP: было 30*60, ускорено для диагностики
+        return 4, 30 * 60  # дожим 2 — через 1 час после заявки (ещё +30 мин)
     if step == 4:
-        demo_photo = os.path.join(PHOTOS_DIR, "dozhim2_demo.png")
-        testimonial_photo = os.path.join(PHOTOS_DIR, "dozhim2_testimonial.png")
-        media = [
-            InputMediaPhoto(media=FSInputFile(p))
-            for p in (demo_photo, testimonial_photo) if os.path.exists(p)
-        ]
-        if media:
-            # У медиагруппы в Telegram нельзя прикрепить inline-кнопку —
-            # поэтому шлём картинки альбомом, а текст с кнопкой отдельным сообщением следом
-            await bot.send_media_group(chat_id, media)
-        await bot.send_message(
-            chat_id, DOZHIM_2_TEXT,
-            reply_markup=pay_cta_keyboard("Получить доступ к боту"),
-        )
-        return 5, 15  # TEMP: было 60*60, ускорено для диагностики
+        # В Miro у дожима 2 нет фото — только текст (плейсхолдер "видео на
+        # 10-15 сек" не реализован отдельным шагом). Раньше сюда по ошибке
+        # прикреплялась медиагруппа из фото6+фото8 — убрано.
+        kb = pay_cta_keyboard("Получить доступ к боту")
+        await bot.send_message(chat_id, DOZHIM_2_TEXT, reply_markup=kb)
+        return 5, 60 * 60  # дожим 3 — через 2 часа после заявки (ещё +1 час)
     if step == 5:
         dozhim3_photo = os.path.join(PHOTOS_DIR, "dozhim3.jpg")
         kb = pay_cta_keyboard("Попробовать бота")
@@ -417,15 +459,36 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
             await bot.send_photo(chat_id, FSInputFile(dozhim3_photo), caption=DOZHIM_3_TEXT, reply_markup=kb)
         else:
             await bot.send_message(chat_id, DOZHIM_3_TEXT, reply_markup=kb)
-        return 6, 15  # TEMP: было 24*60*60, ускорено для диагностики
+        return 6, seconds_until_msk(1, 12)  # день 2 в 12 МСК
     if step == 6:
+        demo_photo = os.path.join(PHOTOS_DIR, "dozhim2_demo.png")
+        kb = pay_cta_keyboard("Получить доступ")
+        if os.path.exists(demo_photo):
+            await bot.send_photo(chat_id, FSInputFile(demo_photo), caption=DOZHIM_5_TEXT, reply_markup=kb)
+        else:
+            await bot.send_message(chat_id, DOZHIM_5_TEXT, reply_markup=kb)
+        return 7, seconds_until_msk(0, 19)  # день 2 в 19 МСК (тот же день)
+    if step == 7:
         price_photo = os.path.join(PHOTOS_DIR, "dozhim4_price.png")
-        kb = pay_cta_keyboard("Забрать доступ")
+        kb = pay_cta_keyboard("Попробовать бота")
         if os.path.exists(price_photo):
             await bot.send_photo(chat_id, FSInputFile(price_photo), caption=DOZHIM_4_TEXT, reply_markup=kb)
         else:
             await bot.send_message(chat_id, DOZHIM_4_TEXT, reply_markup=kb)
-        return 7, None  # последний дожим — дальше не шлём
+        return 8, seconds_until_msk(1, 17)  # день 3 в 17 МСК
+    if step == 8:
+        testimonial_photo = os.path.join(PHOTOS_DIR, "dozhim2_testimonial.png")
+        kb = pay_cta_keyboard("Оплатить бота")
+        if os.path.exists(testimonial_photo):
+            await bot.send_photo(chat_id, FSInputFile(testimonial_photo), caption=DOZHIM_6_TEXT, reply_markup=kb)
+        else:
+            await bot.send_message(chat_id, DOZHIM_6_TEXT, reply_markup=kb)
+        return 9, seconds_until_msk(1, 15)  # день 4 в 15 МСК
+    if step == 9:
+        # Последнее напоминание — без фото (сверено визуально в Miro).
+        kb = pay_cta_keyboard("Оплатить бота")
+        await bot.send_message(chat_id, DOZHIM_7_TEXT, reply_markup=kb)
+        return 10, None  # последний дожим — дальше не шлём
     return None, None
 
 async def mark_paid(user_id: str, tier: str):
