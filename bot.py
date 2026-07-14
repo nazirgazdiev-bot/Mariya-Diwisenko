@@ -330,6 +330,10 @@ _diag = {
     "last_webhook_status": None,
     "last_webhook_result": None,
     "last_payment_link_order_id": None,
+    "last_funnel_error": None,
+    "last_funnel_error_step": None,
+    "last_funnel_error_at": None,
+    "last_funnel_step_sent": None,
 }
 
 
@@ -381,7 +385,7 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
         return 2, 10
     if step == 2:
         await send_tariff_card(chat_id)
-        return 3, 30 * 60
+        return 3, 15  # TEMP: было 30*60, ускорено для диагностики
     if step == 3:
         dozhim1_photo = os.path.join(PHOTOS_DIR, "dozhim1.jpg")
         kb = pay_cta_keyboard("Получить доступ")
@@ -389,7 +393,7 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
             await bot.send_photo(chat_id, FSInputFile(dozhim1_photo), caption=DOZHIM_1_TEXT, reply_markup=kb)
         else:
             await bot.send_message(chat_id, DOZHIM_1_TEXT, reply_markup=kb)
-        return 4, 30 * 60
+        return 4, 15  # TEMP: было 30*60, ускорено для диагностики
     if step == 4:
         demo_photo = os.path.join(PHOTOS_DIR, "dozhim2_demo.png")
         testimonial_photo = os.path.join(PHOTOS_DIR, "dozhim2_testimonial.png")
@@ -405,7 +409,7 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
             chat_id, DOZHIM_2_TEXT,
             reply_markup=pay_cta_keyboard("Получить доступ к боту"),
         )
-        return 5, 60 * 60
+        return 5, 15  # TEMP: было 60*60, ускорено для диагностики
     if step == 5:
         dozhim3_photo = os.path.join(PHOTOS_DIR, "dozhim3.jpg")
         kb = pay_cta_keyboard("Попробовать бота")
@@ -413,7 +417,7 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
             await bot.send_photo(chat_id, FSInputFile(dozhim3_photo), caption=DOZHIM_3_TEXT, reply_markup=kb)
         else:
             await bot.send_message(chat_id, DOZHIM_3_TEXT, reply_markup=kb)
-        return 6, 24 * 60 * 60  # ещё один дожим (про деньги) через сутки
+        return 6, 15  # TEMP: было 24*60*60, ускорено для диагностики
     if step == 6:
         price_photo = os.path.join(PHOTOS_DIR, "dozhim4_price.png")
         kb = pay_cta_keyboard("Забрать доступ")
@@ -555,11 +559,15 @@ async def funnel_tick():
         uid = sub["user_id"]
         try:
             next_step, delay = await send_funnel_step(int(uid), sub["funnel_step"])
-        except Exception:
+        except Exception as e:
             # юзер заблокировал бота и т.п. — останавливаем воронку, чтобы не долбить
             log.exception("Не отправился шаг воронки user_id=%s step=%s", uid, sub["funnel_step"])
+            _diag["last_funnel_error"] = f"{type(e).__name__}: {e}"
+            _diag["last_funnel_error_step"] = sub["funnel_step"]
+            _diag["last_funnel_error_at"] = datetime.now(timezone.utc).isoformat()
             await storage.set_funnel_step(uid, sub["funnel_step"], None)
             continue
+        _diag["last_funnel_step_sent"] = sub["funnel_step"]
         if next_step is None:
             await storage.set_funnel_step(uid, sub["funnel_step"], None)
         else:
