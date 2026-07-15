@@ -155,6 +155,18 @@ def find_cat_sub_for_recipe(recipe: dict):
 
 FUNNEL_CHECK_INTERVAL = 25          # секунд между проверками фоновой задачи
 
+# Тестовый режим воронки: включается переменной окружения FUNNEL_TEST_MODE=1
+# на Railway (без правки кода). Схлопывает все задержки между дожимами до
+# FUNNEL_TEST_INTERVAL_SEC секунд (по умолчанию 300 = 5 минут), чтобы можно
+# было быстро прогнать всю цепочку глазами. НЕ ЗАБЫТЬ ВЫКЛЮЧИТЬ после теста —
+# иначе в проде дожимы будут лететь раз в 5 минут вместо реальных дней.
+FUNNEL_TEST_MODE = os.environ.get("FUNNEL_TEST_MODE", "0") == "1"
+FUNNEL_TEST_INTERVAL = int(os.environ.get("FUNNEL_TEST_INTERVAL_SEC", "300"))
+
+def dbg_delay(real_delay):
+    """В тестовом режиме подменяет реальную задержку на FUNNEL_TEST_INTERVAL."""
+    return FUNNEL_TEST_INTERVAL if FUNNEL_TEST_MODE else real_delay
+
 TIERS = {
     "1m": {"title": "1 месяц — 1690₽", "days": 30, "price": 1690},
     "3m": {"title": "3 месяца — 3990₽ (выгоднее на 20%)", "days": 90, "price": 3990},
@@ -414,6 +426,10 @@ def next_renewal_schedule(paid_until_iso: str, from_stage: int) -> tuple[int, st
     через /testpay и т.п.), чтобы не заваливать пользователя просроченными
     напоминаниями. None — этапы закончились (после win-back)."""
     now = now_utc()
+    if FUNNEL_TEST_MODE and from_stage <= 5:
+        # Тестовый режим: игнорируем реальные день/час из Miro, просто
+        # следующий этап продления через FUNNEL_TEST_INTERVAL секунд.
+        return from_stage, (now + timedelta(seconds=FUNNEL_TEST_INTERVAL)).isoformat()
     for stage in range(from_stage, 6):
         target_msk = renewal_target_msk(paid_until_iso, stage)
         if target_msk is None:
@@ -429,6 +445,9 @@ def renewal_cta_keyboard():
         [InlineKeyboardButton(text="Продлить подписку ✅", callback_data="show_renewal_tariffs")]
     ])
 
+
+_diag["funnel_test_mode"] = FUNNEL_TEST_MODE
+_diag["funnel_test_interval_sec"] = FUNNEL_TEST_INTERVAL if FUNNEL_TEST_MODE else None
 
 prodamus_client = ProdamusClient(PRODAMUS_SECRET_KEY or "", PRODAMUS_SHOP_URL) if PRODAMUS_SECRET_KEY else None
 # Тестовый режим Продамуса: платёж проходит без реальной карты, подпись при этом
@@ -490,6 +509,7 @@ _diag = {
     "last_funnel_error_step": None,
     "last_funnel_error_at": None,
     "last_funnel_step_sent": None,
+    "funnel_test_mode": None,  # выставится ниже, после чтения FUNNEL_TEST_MODE
 }
 
 
@@ -566,7 +586,7 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
         return 2, 15  # тариф-карта — ЧЕРЕЗ 15 СЕКУНД
     if step == 2:
         await send_tariff_card(chat_id)
-        return 3, 30 * 60  # дожим 1 — через 30 минут после заявки
+        return 3, dbg_delay(30 * 60)  # дожим 1 — через 30 минут после заявки
     if step == 3:
         dozhim1_photo = os.path.join(PHOTOS_DIR, "dozhim1.jpg")
         kb = pay_cta_keyboard("Получить доступ")
@@ -574,14 +594,14 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
             await bot.send_photo(chat_id, FSInputFile(dozhim1_photo), caption=DOZHIM_1_TEXT, reply_markup=kb)
         else:
             await bot.send_message(chat_id, DOZHIM_1_TEXT, reply_markup=kb)
-        return 4, 30 * 60  # дожим 2 — через 1 час после заявки (ещё +30 мин)
+        return 4, dbg_delay(30 * 60)  # дожим 2 — через 1 час после заявки (ещё +30 мин)
     if step == 4:
         # В Miro у дожима 2 нет фото — только текст (плейсхолдер "видео на
         # 10-15 сек" не реализован отдельным шагом). Раньше сюда по ошибке
         # прикреплялась медиагруппа из фото6+фото8 — убрано.
         kb = pay_cta_keyboard("Получить доступ к боту")
         await bot.send_message(chat_id, DOZHIM_2_TEXT, reply_markup=kb)
-        return 5, 60 * 60  # дожим 3 — через 2 часа после заявки (ещё +1 час)
+        return 5, dbg_delay(60 * 60)  # дожим 3 — через 2 часа после заявки (ещё +1 час)
     if step == 5:
         dozhim3_photo = os.path.join(PHOTOS_DIR, "dozhim3.jpg")
         kb = pay_cta_keyboard("Попробовать бота")
@@ -589,7 +609,7 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
             await bot.send_photo(chat_id, FSInputFile(dozhim3_photo), caption=DOZHIM_3_TEXT, reply_markup=kb)
         else:
             await bot.send_message(chat_id, DOZHIM_3_TEXT, reply_markup=kb)
-        return 6, seconds_until_msk(1, 12)  # день 2 в 12 МСК
+        return 6, dbg_delay(seconds_until_msk(1, 12))  # день 2 в 12 МСК
     if step == 6:
         demo_photo = os.path.join(PHOTOS_DIR, "dozhim2_demo.png")
         kb = pay_cta_keyboard("Получить доступ")
@@ -597,7 +617,7 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
             await bot.send_photo(chat_id, FSInputFile(demo_photo), caption=DOZHIM_5_TEXT, reply_markup=kb)
         else:
             await bot.send_message(chat_id, DOZHIM_5_TEXT, reply_markup=kb)
-        return 7, seconds_until_msk(0, 19)  # день 2 в 19 МСК (тот же день)
+        return 7, dbg_delay(seconds_until_msk(0, 19))  # день 2 в 19 МСК (тот же день)
     if step == 7:
         price_photo = os.path.join(PHOTOS_DIR, "dozhim4_price.png")
         kb = pay_cta_keyboard("Попробовать бота")
@@ -605,7 +625,7 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
             await bot.send_photo(chat_id, FSInputFile(price_photo), caption=DOZHIM_4_TEXT, reply_markup=kb)
         else:
             await bot.send_message(chat_id, DOZHIM_4_TEXT, reply_markup=kb)
-        return 8, seconds_until_msk(1, 17)  # день 3 в 17 МСК
+        return 8, dbg_delay(seconds_until_msk(1, 17))  # день 3 в 17 МСК
     if step == 8:
         testimonial_photo = os.path.join(PHOTOS_DIR, "dozhim2_testimonial.png")
         kb = pay_cta_keyboard("Оплатить бота")
@@ -613,7 +633,7 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
             await bot.send_photo(chat_id, FSInputFile(testimonial_photo), caption=DOZHIM_6_TEXT, reply_markup=kb)
         else:
             await bot.send_message(chat_id, DOZHIM_6_TEXT, reply_markup=kb)
-        return 9, seconds_until_msk(1, 15)  # день 4 в 15 МСК
+        return 9, dbg_delay(seconds_until_msk(1, 15))  # день 4 в 15 МСК
     if step == 9:
         last_photo = os.path.join(PHOTOS_DIR, "dozhim7_last.png")
         kb = pay_cta_keyboard("Оплатить бота")
