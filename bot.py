@@ -154,7 +154,6 @@ def find_cat_sub_for_recipe(recipe: dict):
 # ─── Воронка продаж: тексты, тарифы, клавиатуры ──────────────────────────────
 
 FUNNEL_CHECK_INTERVAL = 25          # секунд между проверками фоновой задачи
-RENEWAL_REMIND_BEFORE = 3 * 86400   # напоминать о продлении за 3 дня
 
 TIERS = {
     "1m": {"title": "1 месяц — 1690₽", "days": 30, "price": 1690},
@@ -270,18 +269,86 @@ PAID_TEXT = (
     "1️⃣ Загляни в «Рецепты» — полистай категории, сохрани в избранное что приглянулось\n"
     "2️⃣ Нажми «Спросить МарИИю» и попроси собрать тебе рацион на день/неделю — "
     "просто напиши свою цель (любимые продукты, на что аллергия, свою цель и КБЖУ)\n\n"
-    "P.s. если не знаешь КБЖУ МарИИя тоже сможет рассчитать тебе его, просто напиши "
+    "P.s. если не знаешь КБЖУ МарИИя также сможет рассчитать тебе его, просто напиши "
     "свой рост/вес, цель (похудение, набор) и желаемый вес, МарИИя высчитает КБЖУ "
     "под тебя по моей методике!\n\n"
     "<b>Пользуйся в удовольствие. Я вложила сюда всю свою систему питания — "
-    "теперь она твоя 💫</b>"
+    "теперь она твоя 🤍</b>"
 )
 
-# TODO: точный текст пришлёт Мария — пока нейтральная заглушка
-RENEWAL_TEXT = (
-    "⏰ Твоя подписка скоро закончится — вместе с ней закроется доступ к рецептам "
-    "и МарИИе.\n\nЧтобы ничего не потерять, продли доступ заранее 👇"
+# ─── Воронка продления (после оплаты) — сверено с Miro 2026-07-15 ────────────
+# Расписание считается от paid_until (см. renewal_target_msk), не от текущего
+# момента — переживает рестарты бота и правильно работает даже если сервис
+# не поднимался в момент, когда должно было прийти напоминание.
+
+RENEWAL_3D_TEXT = (
+    "Привет! 🤍 Напоминаю: твой доступ к боту заканчивается через 3 дня\n\n"
+    "За это время МарИИя наверняка стала твоим помощником — считала КБЖУ, "
+    "собирала меню, избавляла от вечного «что готовить».\n\n"
+    "Чтобы ничего из этого не потерять — продли доступ заранее 👇\n\n"
+    "▪️ 1 месяц — 1690₽\n"
+    "▪️ 3 месяца — 3990₽ (выгоднее на 20%)\n"
+    "▪️ 6 месяцев — 6990₽ (выгоднее на 30%)"
 )
+
+RENEWAL_1D_TEXT = (
+    "Твой доступ закрывается уже завтра ⏳\n\n"
+    "Совсем скоро рецепты и МарИИя станут недоступны. А значит — снова считать "
+    "самой, снова ломать голову над меню, снова этот вопрос «что бы приготовить».\n\n"
+    "Не возвращайся к хаосу — продли за пару секунд 👇"
+)
+
+RENEWAL_DAYOF_TEXT = (
+    "Сегодня последний день твоего доступа 🤍\n\n"
+    "После полуночи бот закроется. Если хочешь и дальше готовить по моим "
+    "рецептам и держать питание под контролем с МарИИей — самое время продлить.\n\n"
+    "Одно нажатие — и остаёшься с помощником 👇"
+)
+
+RENEWAL_1H_TEXT = (
+    "⏰ Остался час.\n\n"
+    "Через час доступ закроется, и МарИИя попрощается с тобой. Если не "
+    "успеешь продлить — придётся начинать оплату заново позже.\n\n"
+    "Сохрани доступ прямо сейчас, и перестань париться о том что приготовить, "
+    "это займёт 10 секунд 👇"
+)
+
+RENEWAL_WINBACK_TEXT = (
+    "Скучаешь по МарИИе?\n\n"
+    "🤍Твой доступ закрылся пару дней назад. Если поймала себя на том, что "
+    "снова не знаешь что приготовить и считаешь всё вручную — возвращайся, "
+    "я всегда тебе рада.\n\n"
+    "Если все таки решишься вернуться — у меня для тебя небольшой подарок 🎁\n\n"
+    "При возобновлении подписки на бота — тренировочный комплекс для зала "
+    "в подарок)\n\n"
+    "Вернуться к рецептам и МарИИе и получить бонус 👇"
+)
+
+RENEWAL_TARIFF_TEXT_TMPL = (
+    "🤍 {name}, выбери тариф для продления подписки:\n\n"
+    "▪️ 1 месяц — 1690₽\n"
+    "▪️ 3 месяца — 3990₽ (выгоднее на 20%)\n"
+    "▪️ 6 месяцев — 6990₽ (выгоднее на 30%)"
+)
+
+# Этап 1: за 3 дня в 12:00 МСК | 2: за 1 день в 12:00 МСК |
+# 3: в день списания в 10:00 МСК | 4: за 1 час до отключения (23:00 МСК того
+# же дня — ровно за час до полуночного отключения) | 5: win-back через 2 дня
+# после окончания подписки в 12:00 МСК.
+RENEWAL_STAGE_TEXTS = {
+    1: RENEWAL_3D_TEXT,
+    2: RENEWAL_1D_TEXT,
+    3: RENEWAL_DAYOF_TEXT,
+    4: RENEWAL_1H_TEXT,
+    5: RENEWAL_WINBACK_TEXT,
+}
+RENEWAL_STAGE_PHOTOS = {
+    1: "renewal_3days.png",
+    2: "renewal_1day.png",
+    3: "renewal_dayof.png",
+    4: None,  # в Miro у этой карточки нет картинки — только текст
+    5: "renewal_winback.png",
+}
 
 
 def tariffs_keyboard():
@@ -317,6 +384,50 @@ def seconds_until_msk(days_ahead: int, hour: int, minute: int = 0) -> float:
         hour, minute, tzinfo=MSK,
     )
     return max((target - now_msk).total_seconds(), 60.0)
+
+
+def renewal_target_msk(paid_until_iso: str, stage: int) -> datetime | None:
+    """Абсолютное время (МСК) очередного этапа воронки продления, считая от
+    даты окончания подписки paid_until. Стадии 1-5 — см. RENEWAL_STAGE_TEXTS."""
+    paid_dt = datetime.fromisoformat(paid_until_iso)
+    if paid_dt.tzinfo is None:
+        paid_dt = paid_dt.replace(tzinfo=timezone.utc)
+    base_date = paid_dt.astimezone(MSK).date()
+    if stage == 1:
+        d, h, m = base_date - timedelta(days=3), 12, 0
+    elif stage == 2:
+        d, h, m = base_date - timedelta(days=1), 12, 0
+    elif stage == 3:
+        d, h, m = base_date, 10, 0
+    elif stage == 4:
+        d, h, m = base_date, 23, 0
+    elif stage == 5:
+        d, h, m = base_date + timedelta(days=2), 12, 0
+    else:
+        return None
+    return datetime(d.year, d.month, d.day, h, m, tzinfo=MSK)
+
+
+def next_renewal_schedule(paid_until_iso: str, from_stage: int) -> tuple[int, str] | None:
+    """Ищет ближайший ещё не наступивший этап продления начиная с from_stage.
+    Пропускает этапы, чьё время уже прошло (короткий тариф, тестовая оплата
+    через /testpay и т.п.), чтобы не заваливать пользователя просроченными
+    напоминаниями. None — этапы закончились (после win-back)."""
+    now = now_utc()
+    for stage in range(from_stage, 6):
+        target_msk = renewal_target_msk(paid_until_iso, stage)
+        if target_msk is None:
+            continue
+        target_utc = target_msk.astimezone(timezone.utc)
+        if target_utc > now:
+            return stage, target_utc.isoformat()
+    return None
+
+
+def renewal_cta_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Продлить подписку ✅", callback_data="show_renewal_tariffs")]
+    ])
 
 
 prodamus_client = ProdamusClient(PRODAMUS_SECRET_KEY or "", PRODAMUS_SHOP_URL) if PRODAMUS_SECRET_KEY else None
@@ -420,6 +531,25 @@ async def send_tariff_card(chat_id: int):
     else:
         await bot.send_message(chat_id, TARIFF_CARD_TEXT, reply_markup=tariffs_keyboard())
 
+async def send_renewal_stage(chat_id: int, stage: int):
+    text = RENEWAL_STAGE_TEXTS[stage]
+    photo_name = RENEWAL_STAGE_PHOTOS.get(stage)
+    kb = renewal_cta_keyboard()
+    if photo_name:
+        photo_path = os.path.join(PHOTOS_DIR, photo_name)
+        if os.path.exists(photo_path):
+            await bot.send_photo(chat_id, FSInputFile(photo_path), caption=text, reply_markup=kb)
+            return
+    await bot.send_message(chat_id, text, reply_markup=kb)
+
+async def send_renewal_tariff_card(chat_id: int, name: str | None):
+    text = RENEWAL_TARIFF_TEXT_TMPL.format(name=name or "Привет")
+    photo_path = os.path.join(PHOTOS_DIR, "renewal_tariff_card.png")
+    if os.path.exists(photo_path):
+        await bot.send_photo(chat_id, FSInputFile(photo_path), caption=text, reply_markup=tariffs_keyboard())
+    else:
+        await bot.send_message(chat_id, text, reply_markup=tariffs_keyboard())
+
 async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float | None]:
     """Шлёт сообщение шага воронки. Возвращает (следующий шаг, задержка в сек).
 
@@ -485,9 +615,12 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
             await bot.send_message(chat_id, DOZHIM_6_TEXT, reply_markup=kb)
         return 9, seconds_until_msk(1, 15)  # день 4 в 15 МСК
     if step == 9:
-        # Последнее напоминание — без фото (сверено визуально в Miro).
+        last_photo = os.path.join(PHOTOS_DIR, "dozhim7_last.png")
         kb = pay_cta_keyboard("Оплатить бота")
-        await bot.send_message(chat_id, DOZHIM_7_TEXT, reply_markup=kb)
+        if os.path.exists(last_photo):
+            await bot.send_photo(chat_id, FSInputFile(last_photo), caption=DOZHIM_7_TEXT, reply_markup=kb)
+        else:
+            await bot.send_message(chat_id, DOZHIM_7_TEXT, reply_markup=kb)
         return 10, None  # последний дожим — дальше не шлём
     return None, None
 
@@ -499,6 +632,7 @@ async def mark_paid(user_id: str, tier: str):
     бота, это не должно выглядеть как "оплата не прошла"."""
     days = TIERS[tier]["days"]
     paid_until = (now_utc() + timedelta(days=days)).isoformat()
+    renewal_schedule = next_renewal_schedule(paid_until, 1)
     await storage.upsert_subscription(
         user_id,
         status="active",
@@ -506,6 +640,8 @@ async def mark_paid(user_id: str, tier: str):
         paid_until=paid_until,
         funnel_next_at=None,
         renewal_reminder_sent=0,
+        renewal_stage=0,
+        renewal_next_at=renewal_schedule[1] if renewal_schedule else None,
     )
     log.info("Оплата: user_id=%s tier=%s до %s", user_id, tier, paid_until)
     try:
@@ -641,19 +777,21 @@ async def funnel_tick():
         await storage.upsert_subscription(sub["user_id"], status="expired")
         log.info("Подписка истекла: user_id=%s", sub["user_id"])
 
-    # 3. Дожим на продление: paid_until истекает в ближайшие 2 дня
-    deadline_iso = iso_in(RENEWAL_REMIND_BEFORE)
-    for sub in await storage.expiring_subscriptions(now_iso, deadline_iso):
+    # 3. Многоступенчатая воронка продления: за 3 дня / за 1 день / в день
+    # списания / за 1 час / win-back (см. RENEWAL_STAGE_TEXTS).
+    for sub in await storage.due_renewal_users(now_iso):
         uid = sub["user_id"]
+        stage = (sub["renewal_stage"] or 0) + 1
         try:
-            await bot.send_message(
-                int(uid), RENEWAL_TEXT,
-                reply_markup=pay_cta_keyboard("Продлить подписку"),
-            )
+            await send_renewal_stage(int(uid), stage)
         except Exception:
-            log.exception("Не отправилось напоминание о продлении user_id=%s", uid)
-        # флаг ставим в любом случае, чтобы не ретраить каждый тик
-        await storage.upsert_subscription(uid, renewal_reminder_sent=1)
+            log.exception("Не отправился шаг продления user_id=%s stage=%s", uid, stage)
+        nxt = next_renewal_schedule(sub["paid_until"], stage + 1) if sub["paid_until"] else None
+        await storage.upsert_subscription(
+            uid,
+            renewal_stage=stage,
+            renewal_next_at=nxt[1] if nxt else None,
+        )
 
 async def funnel_worker():
     while True:
@@ -742,6 +880,11 @@ async def cb_show_tariffs(callback: CallbackQuery):
     await send_tariff_card(callback.message.chat.id)
     await callback.answer()
 
+@dp.callback_query(F.data == "show_renewal_tariffs")
+async def cb_show_renewal_tariffs(callback: CallbackQuery):
+    await send_renewal_tariff_card(callback.message.chat.id, callback.from_user.first_name)
+    await callback.answer()
+
 @dp.callback_query(F.data.startswith("tier:"))
 async def cb_choose_tier(callback: CallbackQuery):
     tier = callback.data.split(":")[1]
@@ -749,16 +892,21 @@ async def cb_choose_tier(callback: CallbackQuery):
         await callback.answer("Неизвестный тариф")
         return
     uid = str(callback.from_user.id)
+    name = callback.from_user.first_name or "Привет"
     link = await generate_payment_link(uid, tier)
-    title = TIERS[tier]["title"]
+    # Персонализированный формат по просьбе Назира: ссылка не идёт "голой".
+    caption = (
+        f"{name}, вот твоя ссылка на оплату 👇\n\n"
+        "Сразу после оплаты в боте появится функционал с рецептами и твоим "
+        "личным AI-ассистентом МарИИей"
+    )
     if link.startswith("http"):
-        # Когда подключим Продамус — ссылка станет настоящей и уйдёт кнопкой
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Оплатить", url=link)]
         ])
-        await callback.message.answer(f"Оплата: <b>{title}</b> 👇", reply_markup=kb)
+        await callback.message.answer(caption, reply_markup=kb)
     else:
-        await callback.message.answer(f"💳 <b>{title}</b>\n\n{link}")
+        await callback.message.answer(f"{caption}\n\n{link}")
     await callback.answer()
 
 @dp.message(Command("testpay"))

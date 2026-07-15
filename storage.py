@@ -60,12 +60,30 @@ class Storage:
                     funnel_step INTEGER NOT NULL DEFAULT 0,
                     funnel_next_at TEXT,
                     renewal_reminder_sent INTEGER NOT NULL DEFAULT 0,
+                    renewal_stage INTEGER NOT NULL DEFAULT 0,
+                    renewal_next_at TEXT,
                     created_at TEXT,
                     updated_at TEXT
                 )""")
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_subs_funnel ON subscriptions(funnel_next_at)"
             )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_subs_renewal ON subscriptions(renewal_next_at)"
+            )
+            # Миграция для баз, созданных до появления многошаговой воронки
+            # продления (renewal_stage/renewal_next_at) — ADD COLUMN IF NOT EXISTS
+            # для sqlite делаем вручную через PRAGMA table_info.
+            async with db.execute("PRAGMA table_info(subscriptions)") as cur:
+                existing_cols = {row[1] for row in await cur.fetchall()}
+            if "renewal_stage" not in existing_cols:
+                await db.execute(
+                    "ALTER TABLE subscriptions ADD COLUMN renewal_stage INTEGER NOT NULL DEFAULT 0"
+                )
+            if "renewal_next_at" not in existing_cols:
+                await db.execute(
+                    "ALTER TABLE subscriptions ADD COLUMN renewal_next_at TEXT"
+                )
             await db.commit()
 
     @staticmethod
@@ -185,6 +203,7 @@ class Storage:
     _SUB_FIELDS = (
         "user_id", "status", "tier", "paid_until",
         "funnel_step", "funnel_next_at", "renewal_reminder_sent",
+        "renewal_stage", "renewal_next_at",
         "created_at", "updated_at",
     )
     _SUB_SELECT = "SELECT " + ", ".join(_SUB_FIELDS) + " FROM subscriptions"
@@ -211,6 +230,8 @@ class Storage:
         funnel_step=_UNSET,
         funnel_next_at=_UNSET,
         renewal_reminder_sent=_UNSET,
+        renewal_stage=_UNSET,
+        renewal_next_at=_UNSET,
     ):
         """Частичное обновление: меняются только переданные поля.
         Явный None допустим (например funnel_next_at=None очищает дату)."""
@@ -222,6 +243,8 @@ class Storage:
             "funnel_step": funnel_step,
             "funnel_next_at": funnel_next_at,
             "renewal_reminder_sent": renewal_reminder_sent,
+            "renewal_stage": renewal_stage,
+            "renewal_next_at": renewal_next_at,
         }
         fields = {k: v for k, v in passed.items() if v is not _UNSET}
         async with aiosqlite.connect(self.db_path) as db:
@@ -243,16 +266,20 @@ class Storage:
                     "funnel_step": 0,
                     "funnel_next_at": None,
                     "renewal_reminder_sent": 0,
+                    "renewal_stage": 0,
+                    "renewal_next_at": None,
                 }
                 values.update(fields)
                 await db.execute(
                     """INSERT INTO subscriptions
                        (user_id, status, tier, paid_until, funnel_step,
-                        funnel_next_at, renewal_reminder_sent, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        funnel_next_at, renewal_reminder_sent,
+                        renewal_stage, renewal_next_at, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (user_id, values["status"], values["tier"], values["paid_until"],
                      values["funnel_step"], values["funnel_next_at"],
-                     values["renewal_reminder_sent"], now, now),
+                     values["renewal_reminder_sent"], values["renewal_stage"],
+                     values["renewal_next_at"], now, now),
                 )
             await db.commit()
 
@@ -272,17 +299,18 @@ class Storage:
                 rows = await cur.fetchall()
         return [self._sub_row(r) for r in rows]
 
-    async def expiring_subscriptions(self, now_iso: str, deadline_iso: str) -> list[dict]:
-        """Активные подписки, которые истекают до deadline и ещё не получали напоминание."""
+    async def due_renewal_users(self, now_iso: str) -> list[dict]:
+        """Кому пора слать следующий шаг многоступенчатой воронки продления
+        (за 3 дня / за 1 день / в день списания / за 1 час / win-back —
+        см. RENEWAL_STAGES в bot.py). Работает по точному времени
+        renewal_next_at, а не по флагу "уже отправлено", так что не зависит
+        от статуса (active/expired) — win-back шлётся уже после истечения."""
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
                 f"""{self._SUB_SELECT}
-                    WHERE status = 'active'
-                      AND paid_until IS NOT NULL
-                      AND paid_until > ?
-                      AND paid_until <= ?
-                      AND renewal_reminder_sent = 0""",
-                (now_iso, deadline_iso),
+                    WHERE renewal_next_at IS NOT NULL
+                      AND renewal_next_at <= ?""",
+                (now_iso,),
             ) as cur:
                 rows = await cur.fetchall()
         return [self._sub_row(r) for r in rows]
