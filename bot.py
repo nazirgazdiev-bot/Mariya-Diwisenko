@@ -370,9 +370,13 @@ def tariffs_keyboard():
     ])
 
 def pay_cta_keyboard(text: str):
-    """Одна кнопка, ведущая на карточку с тарифами."""
+    """Кнопка на дожимах — ведёт на карточку с тарифами. По просьбе Кирилла
+    2026-07-16: дожимы должны вести на ту же карточку с фото и именем
+    ("🤍 Имя, выбери тариф..."), что и воронка продления, а не на старую
+    TARIFF_CARD_TEXT — та теперь шлётся только один раз, автоматически,
+    на шаге 2 воронки (см. send_funnel_step)."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=text, callback_data="show_tariffs")]
+        [InlineKeyboardButton(text=text, callback_data="show_renewal_tariffs")]
     ])
 
 
