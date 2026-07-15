@@ -154,7 +154,7 @@ def find_cat_sub_for_recipe(recipe: dict):
 # ─── Воронка продаж: тексты, тарифы, клавиатуры ──────────────────────────────
 
 FUNNEL_CHECK_INTERVAL = 25          # секунд между проверками фоновой задачи
-RENEWAL_REMIND_BEFORE = 2 * 86400   # напоминать о продлении за 2 дня
+RENEWAL_REMIND_BEFORE = 3 * 86400   # напоминать о продлении за 3 дня
 
 TIERS = {
     "1m": {"title": "1 месяц — 1690₽", "days": 30, "price": 1690},
