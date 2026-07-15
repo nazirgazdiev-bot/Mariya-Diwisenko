@@ -446,9 +446,6 @@ def renewal_cta_keyboard():
     ])
 
 
-_diag["funnel_test_mode"] = FUNNEL_TEST_MODE
-_diag["funnel_test_interval_sec"] = FUNNEL_TEST_INTERVAL if FUNNEL_TEST_MODE else None
-
 prodamus_client = ProdamusClient(PRODAMUS_SECRET_KEY or "", PRODAMUS_SHOP_URL) if PRODAMUS_SECRET_KEY else None
 # Тестовый режим Продамуса: платёж проходит без реальной карты, подпись при этом
 # остаётся боевой (не влияет на проверку вебхука) — включается только через env var,
@@ -511,6 +508,8 @@ _diag = {
     "last_funnel_step_sent": None,
     "funnel_test_mode": None,  # выставится ниже, после чтения FUNNEL_TEST_MODE
 }
+_diag["funnel_test_mode"] = FUNNEL_TEST_MODE
+_diag["funnel_test_interval_sec"] = FUNNEL_TEST_INTERVAL if FUNNEL_TEST_MODE else None
 
 
 # ─── Воронка продаж: логика ───────────────────────────────────────────────────
