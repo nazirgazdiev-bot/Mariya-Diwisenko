@@ -686,14 +686,16 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
         return 10, None  # последний дожим — дальше не шлём
     return None, None
 
-async def mark_paid(user_id: str, tier: str):
+async def mark_paid(user_id: str, tier: str, paid_until_override: str | None = None):
     """Ветка "после оплаты": вызывается вебхуком Продамуса (и /testpay для теста).
     Открытие доступа в БД — критическая часть и должна прокидывать исключение
     наверх (чтобы вебхук вернул ошибку и Продамус повторил попытку).
     Отправка уведомления пользователю — best-effort: если юзер заблокировал
-    бота, это не должно выглядеть как "оплата не прошла"."""
+    бота, это не должно выглядеть как "оплата не прошла".
+    paid_until_override — короткий срок доступа для теста (чтобы за пару минут
+    увидеть полный цикл: доступ → напоминания → истечение → win-back)."""
     days = TIERS[tier]["days"]
-    paid_until = (now_utc() + timedelta(days=days)).isoformat()
+    paid_until = paid_until_override or (now_utc() + timedelta(days=days)).isoformat()
     renewal_schedule = next_renewal_schedule(paid_until, 1)
     await storage.upsert_subscription(
         user_id,
@@ -991,7 +993,14 @@ async def cmd_testpay(message: Message):
     if tier not in TIERS:
         await message.answer("Тариф: 1m, 3m или 6m")
         return
-    await mark_paid(str(message.from_user.id), tier)
+    # В тесте пост-оплатной серии выдаём КОРОТКИЙ доступ, чтобы он реально
+    # истёк по ходу теста (примерно на этапе "день списания") — так видно,
+    # что логика окончания подписки работает: доступ закрывается, меню
+    # рецептов/МарИИи перестаёт пускать. Иначе (30 дней) доступ бы остался.
+    override = None
+    if not is_admin and RENEWAL_TEST_INTERVAL > 0:
+        override = (now_utc() + timedelta(seconds=RENEWAL_TEST_INTERVAL * 3 + 30)).isoformat()
+    await mark_paid(str(message.from_user.id), tier, paid_until_override=override)
 
 # ─── Меню рецептов ────────────────────────────────────────────────────────────
 
