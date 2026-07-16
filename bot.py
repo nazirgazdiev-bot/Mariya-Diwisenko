@@ -1137,13 +1137,11 @@ async def show_recipe(callback: CallbackQuery):
                     FSInputFile(photo_path),
                     caption=text,
                     reply_markup=recipe_keyboard(cat_idx, sub_idx, recipe_id, is_fav),
-                    protect_content=True,
                 )
                 photo_sent_with_caption = True
             else:
                 await callback.message.answer_photo(
                     FSInputFile(photo_path),
-                    protect_content=True,
                 )
         except Exception:
             # не глотаем молча: фото не ушло — логируем и шлём хотя бы текст
@@ -1153,7 +1151,6 @@ async def show_recipe(callback: CallbackQuery):
         await callback.message.answer(
             text,
             reply_markup=recipe_keyboard(cat_idx, sub_idx, recipe_id, is_fav),
-            protect_content=True,
         )
     await callback.answer()
 
@@ -1177,12 +1174,19 @@ async def handle_back(callback: CallbackQuery):
         cat_idx, sub_idx = int(parts[2]), int(parts[3])
         cat = CATEGORIES[cat_idx]
         sub = STRUCTURE[cat][sub_idx]
+        # Рецепт мог быть показан как фото — его нельзя "отредактировать" в
+        # текстовый список, поэтому удаляем старое сообщение и шлём свежий
+        # список (иначе рецепт-фото зависает сверху — жалоба Назира 2026-07-16).
         try:
             await callback.message.edit_text(
                 f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
                 reply_markup=recipes_keyboard(cat_idx, sub_idx),
             )
         except Exception:
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
             await callback.message.answer(
                 f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
                 reply_markup=recipes_keyboard(cat_idx, sub_idx),
