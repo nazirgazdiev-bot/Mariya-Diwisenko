@@ -163,6 +163,14 @@ FUNNEL_CHECK_INTERVAL = 25          # секунд между проверкам
 FUNNEL_TEST_MODE = os.environ.get("FUNNEL_TEST_MODE", "0") == "1"
 FUNNEL_TEST_INTERVAL = int(os.environ.get("FUNNEL_TEST_INTERVAL_SEC", "300"))
 
+# Отдельный тест ПОСТ-ОПЛАТНОЙ серии (продление/win-back), НЕЗАВИСИМ от
+# FUNNEL_TEST_MODE: если RENEWAL_TEST_INTERVAL_SEC > 0, то все 5 этапов
+# продления идут подряд с этим интервалом (в секундах), игнорируя реальные
+# день/час из Miro. 0 = боевой режим (реальные даты от paid_until).
+# Заодно этот режим открывает /testpay всем (чтобы Назир мог сам выдать
+# себе доступ и посмотреть рецепты/МарИИю и серию после оплаты).
+RENEWAL_TEST_INTERVAL = int(os.environ.get("RENEWAL_TEST_INTERVAL_SEC", "0"))
+
 def dbg_delay(real_delay):
     """В тестовом режиме подменяет реальную задержку на FUNNEL_TEST_INTERVAL."""
     return FUNNEL_TEST_INTERVAL if FUNNEL_TEST_MODE else real_delay
@@ -447,10 +455,10 @@ def next_renewal_schedule(paid_until_iso: str, from_stage: int) -> tuple[int, st
     через /testpay и т.п.), чтобы не заваливать пользователя просроченными
     напоминаниями. None — этапы закончились (после win-back)."""
     now = now_utc()
-    if FUNNEL_TEST_MODE and from_stage <= 5:
-        # Тестовый режим: игнорируем реальные день/час из Miro, просто
-        # следующий этап продления через FUNNEL_TEST_INTERVAL секунд.
-        return from_stage, (now + timedelta(seconds=FUNNEL_TEST_INTERVAL)).isoformat()
+    if RENEWAL_TEST_INTERVAL > 0 and from_stage <= 5:
+        # Тест пост-оплатной серии: игнорируем реальные день/час из Miro,
+        # следующий этап через RENEWAL_TEST_INTERVAL секунд.
+        return from_stage, (now + timedelta(seconds=RENEWAL_TEST_INTERVAL)).isoformat()
     for stage in range(from_stage, 6):
         target_msk = renewal_target_msk(paid_until_iso, stage)
         if target_msk is None:
@@ -531,6 +539,7 @@ _diag = {
 }
 _diag["funnel_test_mode"] = FUNNEL_TEST_MODE
 _diag["funnel_test_interval_sec"] = FUNNEL_TEST_INTERVAL if FUNNEL_TEST_MODE else None
+_diag["renewal_test_interval_sec"] = RENEWAL_TEST_INTERVAL if RENEWAL_TEST_INTERVAL > 0 else None
 
 
 # ─── Воронка продаж: логика ───────────────────────────────────────────────────
@@ -968,11 +977,14 @@ async def cb_choose_tier(callback: CallbackQuery):
 
 @dp.message(Command("testpay"))
 async def cmd_testpay(message: Message):
-    """Тестовая заглушка оплаты: /testpay 1m|3m|6m. Только для админа.
-    Будет удалена после подключения вебхука Продамуса."""
+    """Тестовая заглушка оплаты: /testpay 1m|3m|6m. Доступна админу, а также
+    ВСЕМ, когда включён тест пост-оплатной серии (RENEWAL_TEST_INTERVAL_SEC>0)
+    — чтобы Назир мог сам выдать себе доступ и посмотреть рецепты/МарИИю и
+    серию сообщений после оплаты. Будет удалена после подключения вебхука."""
     if not storage:
         return
-    if not ADMIN_USER_ID or str(message.from_user.id) != ADMIN_USER_ID:
+    is_admin = ADMIN_USER_ID and str(message.from_user.id) == ADMIN_USER_ID
+    if not is_admin and RENEWAL_TEST_INTERVAL <= 0:
         return
     parts = message.text.split()
     tier = parts[1] if len(parts) > 1 else "1m"
