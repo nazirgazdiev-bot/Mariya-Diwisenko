@@ -134,7 +134,7 @@ def format_recipe(recipe: dict) -> str:
         instructions = instructions[:1997] + "..."
 
     text = f"<b>🍳 {name}</b>\n\n"
-    text += f"📊 <b>КБЖУ на 100г:</b>\n"
+    text += "📊 <b>КБЖУ на 100г:</b>\n"
     text += f"🔥 {kcal} ккал  |  🥩 Б: {protein}г  |  🧈 Ж: {fat}г  |  🍞 У: {carbs}г\n\n"
     text += f"🛒 <b>Ингредиенты:</b>\n{ingredients_text}\n\n"
     text += f"👨‍🍳 <b>Приготовление:</b>\n{instructions}"
@@ -890,7 +890,6 @@ async def cmd_start(message: Message):
         await send_welcome(message.chat.id)
         return
 
-    sub = await storage.get_subscription(uid)
     if await has_access(uid):
         await message.answer(
             "👋 Привет! Это сборник полезных рецептов Марии Дивисенко.\n\n"
@@ -1016,6 +1015,9 @@ async def cmd_testpay(message: Message):
 
 @dp.callback_query(F.data.startswith("fav:"))
 async def toggle_favorite(callback: CallbackQuery):
+    if not storage:
+        await callback.answer()
+        return
     if not await has_access(str(callback.from_user.id)):
         await callback.answer()
         await send_tariff_card(callback.message.chat.id)
@@ -1043,6 +1045,8 @@ async def toggle_favorite(callback: CallbackQuery):
 
 @dp.message(F.text == "⭐ Избранное")
 async def show_favorites(message: Message):
+    if not storage:
+        return
     if not await has_access(str(message.from_user.id)):
         await send_tariff_card(message.chat.id)
         return
