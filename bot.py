@@ -168,9 +168,9 @@ def dbg_delay(real_delay):
     return FUNNEL_TEST_INTERVAL if FUNNEL_TEST_MODE else real_delay
 
 TIERS = {
-    "1m": {"title": "1 месяц — 1690₽", "days": 30, "price": 1690},
-    "3m": {"title": "3 месяца — 3990₽ (выгоднее на 20%)", "days": 90, "price": 3990},
-    "6m": {"title": "6 месяцев — 6990₽ (выгоднее на 30%)", "days": 180, "price": 6990},
+    "1m": {"title": "1 месяц — 1690₽", "label": "1 месяц", "days": 30, "price": 1690},
+    "3m": {"title": "3 месяца — 3990₽ (выгоднее на 20%)", "label": "3 месяца", "days": 90, "price": 3990},
+    "6m": {"title": "6 месяцев — 6990₽ (выгоднее на 30%)", "label": "6 месяцев", "days": 180, "price": 6990},
 }
 
 WELCOME_FUNNEL_TEXT = (
@@ -336,6 +336,13 @@ RENEWAL_WINBACK_TEXT = (
     "Вернуться к рецептам и МарИИе и получить бонус 👇"
 )
 
+NEW_TARIFF_TEXT_TMPL = (
+    "<b>🤍 {name}, выбери тариф для оформления подписки:</b>\n\n"
+    "▪️ 1 месяц — 1690₽\n"
+    "▪️ 3 месяца — 3990₽ (выгоднее на 20%)\n"
+    "▪️ 6 месяцев — 6990₽ (выгоднее на 30%)"
+)
+
 RENEWAL_TARIFF_TEXT_TMPL = (
     "<b>🤍 {name}, выбери тариф для продления подписки:</b>\n\n"
     "▪️ 1 месяц — 1690₽\n"
@@ -364,18 +371,26 @@ RENEWAL_STAGE_PHOTOS = {
 
 
 def tariffs_keyboard():
+    """Кнопки выбора тарифа — по просьбе Кирилла 2026-07-16 БЕЗ цены/выгоды
+    в самой кнопке (это идёт только в тексте сообщения над кнопками)."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=TIERS[t]["title"], callback_data=f"tier:{t}")]
+        [InlineKeyboardButton(text=TIERS[t]["label"], callback_data=f"tier:{t}")]
         for t in ("1m", "3m", "6m")
     ])
 
 def pay_cta_keyboard(text: str):
-    """Кнопка на дожимах — ведёт на единую карточку с тарифами (фото + имя,
-    "🤍 Имя, выбери тариф..."). По просьбе Кирилла 2026-07-16 эта же карточка
-    используется везде в боте — старая TARIFF_CARD_TEXT ("🔥 Что ты получишь
-    внутри бота") больше нигде не шлётся, включая шаг 2 воронки."""
+    """Кнопка дожимов (3-9) и кнопка самой TARIFF_CARD_TEXT — ведёт СРАЗУ на
+    карточку выбора тарифа для НОВОЙ подписки ("🤍 Имя, выбери тариф для
+    оформления подписки"), минуя повторный показ TARIFF_CARD_TEXT."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=text, callback_data="show_renewal_tariffs")]
+        [InlineKeyboardButton(text=text, callback_data="show_new_tariffs")]
+    ])
+
+def intro_cta_keyboard(text: str):
+    """Кнопка ТОЛЬКО у шага 1 (видео-текст) — ведёт на TARIFF_CARD_TEXT
+    (шаг 2, "🔥 Что ты получишь внутри бота"), а не сразу на тарифы."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=text, callback_data="show_tariffs")]
     ])
 
 
@@ -543,18 +558,30 @@ async def send_welcome(chat_id: int):
     else:
         await bot.send_message(chat_id, WELCOME_FUNNEL_TEXT, reply_markup=main_keyboard())
 
-async def send_tariff_card(chat_id: int, name: str | None = None):
-    """Единая карточка с тарифами — фото + '🤍 Имя, выбери тариф...', как в
-    Miro. По просьбе Кирилла 2026-07-16 используется ВЕЗДЕ, где раньше была
-    отдельная TARIFF_CARD_TEXT ('🔥 Что ты получишь внутри бота'). Если имя
-    не передали явно (вызов из фоновой воронки без live-апдейта) — берём
-    сохранённое в БД."""
-    if name is None and storage:
-        try:
-            client = await storage.get_client(str(chat_id))
-            name = client.get("name")
-        except Exception:
-            name = None
+async def send_tariff_card(chat_id: int):
+    """Шаг 2 воронки — маркетинговая карточка '🔥 Что ты получишь внутри
+    бота' + tariff_card.png. Кнопка на ней ведёт на карточку выбора тарифа
+    (show_new_tariffs), а не на оплату напрямую."""
+    tariff_photo = os.path.join(PHOTOS_DIR, "tariff_card.png")
+    kb = pay_cta_keyboard("Оплатить доступ ✅")
+    if os.path.exists(tariff_photo):
+        await bot.send_photo(chat_id, FSInputFile(tariff_photo), caption=TARIFF_CARD_TEXT, reply_markup=kb)
+    else:
+        await bot.send_message(chat_id, TARIFF_CARD_TEXT, reply_markup=kb)
+
+async def send_new_tariff_card(chat_id: int, name: str | None):
+    """Карточка выбора тарифа для НОВОЙ подписки ('для оформления') — шлют
+    сюда шаг 2 (по кнопке 'Оплатить доступ') и все дожимы 3-9. ВНИМАНИЕ:
+    отдельного фото для этой карточки нет (Кирилл прислал только фото для
+    варианты 'для продления') — пока шлём текстом без фото."""
+    text = NEW_TARIFF_TEXT_TMPL.format(name=name or "Привет")
+    new_tariff_photo = os.path.join(PHOTOS_DIR, "new_tariff_card.png")
+    if os.path.exists(new_tariff_photo):
+        await bot.send_photo(chat_id, FSInputFile(new_tariff_photo), caption=text, reply_markup=tariffs_keyboard())
+    else:
+        await bot.send_message(chat_id, text, reply_markup=tariffs_keyboard())
+
+async def send_renewal_tariff_card(chat_id: int, name: str | None):
     text = RENEWAL_TARIFF_TEXT_TMPL.format(name=name or "Привет")
     photo_path = os.path.join(PHOTOS_DIR, "renewal_tariff_card.png")
     if os.path.exists(photo_path):
@@ -584,7 +611,7 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
     if step == 1:
         await bot.send_message(
             chat_id, STEP1_VIDEO_TEXT,
-            reply_markup=pay_cta_keyboard("Перейти к оплате"),
+            reply_markup=intro_cta_keyboard("Перейти к оплате бота"),
         )
         return 2, 15  # тариф-карта — ЧЕРЕЗ 15 СЕКУНД
     if step == 2:
@@ -856,7 +883,7 @@ async def cmd_start(message: Message):
     else:
         # Запись есть, но не оплачено — приветствуем и сразу показываем тарифы
         await send_welcome(message.chat.id)
-        await send_tariff_card(message.chat.id, message.from_user.first_name)
+        await send_tariff_card(message.chat.id)
 
 @dp.message(Command("profile"))
 async def cmd_profile(message: Message):
@@ -898,9 +925,19 @@ async def cmd_reset(message: Message):
 
 # ─── Воронка: колбэки и тестовая оплата ──────────────────────────────────────
 
-@dp.callback_query(F.data.in_({"show_tariffs", "show_renewal_tariffs"}))
+@dp.callback_query(F.data == "show_tariffs")
 async def cb_show_tariffs(callback: CallbackQuery):
-    await send_tariff_card(callback.message.chat.id, callback.from_user.first_name)
+    await send_tariff_card(callback.message.chat.id)
+    await callback.answer()
+
+@dp.callback_query(F.data == "show_new_tariffs")
+async def cb_show_new_tariffs(callback: CallbackQuery):
+    await send_new_tariff_card(callback.message.chat.id, callback.from_user.first_name)
+    await callback.answer()
+
+@dp.callback_query(F.data == "show_renewal_tariffs")
+async def cb_show_renewal_tariffs(callback: CallbackQuery):
+    await send_renewal_tariff_card(callback.message.chat.id, callback.from_user.first_name)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("tier:"))
@@ -947,7 +984,7 @@ async def cmd_testpay(message: Message):
 @dp.message(F.text == "🍽 Рецепты")
 async def show_categories(message: Message):
     if not await has_access(str(message.from_user.id)):
-        await send_tariff_card(message.chat.id, message.from_user.first_name)
+        await send_tariff_card(message.chat.id)
         return
     await message.answer("📂 <b>Выбери категорию:</b>", reply_markup=categories_keyboard())
 
@@ -955,7 +992,7 @@ async def show_categories(message: Message):
 async def show_subcategories(callback: CallbackQuery):
     if not await has_access(str(callback.from_user.id)):
         await callback.answer()
-        await send_tariff_card(callback.message.chat.id, callback.from_user.first_name)
+        await send_tariff_card(callback.message.chat.id)
         return
     cat_idx = int(callback.data.split(":")[1])
     cat = CATEGORIES[cat_idx]
@@ -969,7 +1006,7 @@ async def show_subcategories(callback: CallbackQuery):
 async def show_recipes(callback: CallbackQuery):
     if not await has_access(str(callback.from_user.id)):
         await callback.answer()
-        await send_tariff_card(callback.message.chat.id, callback.from_user.first_name)
+        await send_tariff_card(callback.message.chat.id)
         return
     _, cat_idx, sub_idx = callback.data.split(":")
     cat_idx, sub_idx = int(cat_idx), int(sub_idx)
@@ -985,7 +1022,7 @@ async def show_recipes(callback: CallbackQuery):
 async def show_recipe(callback: CallbackQuery):
     if not await has_access(str(callback.from_user.id)):
         await callback.answer()
-        await send_tariff_card(callback.message.chat.id, callback.from_user.first_name)
+        await send_tariff_card(callback.message.chat.id)
         return
     recipe_id = callback.data[4:]
     recipe = RECIPES.get(recipe_id)
@@ -1039,7 +1076,7 @@ async def show_recipe(callback: CallbackQuery):
 async def handle_back(callback: CallbackQuery):
     if not await has_access(str(callback.from_user.id)):
         await callback.answer()
-        await send_tariff_card(callback.message.chat.id, callback.from_user.first_name)
+        await send_tariff_card(callback.message.chat.id)
         return
     parts = callback.data.split(":")
     if parts[1] == "main":
@@ -1072,7 +1109,7 @@ async def handle_back(callback: CallbackQuery):
 @dp.message(F.text == "🤖 Спросить МарИИю")
 async def mariya_intro(message: Message):
     if not await has_access(str(message.from_user.id)):
-        await send_tariff_card(message.chat.id, message.from_user.first_name)
+        await send_tariff_card(message.chat.id)
         return
     await message.answer(
         "🤖 <b>МарИИя — AI-нутрициолог</b>\n\n"
@@ -1093,7 +1130,7 @@ async def handle_text(message: Message):
     uid = str(message.from_user.id)
 
     if not await has_access(uid):
-        await send_tariff_card(message.chat.id, message.from_user.first_name)
+        await send_tariff_card(message.chat.id)
         return
 
     user_text = message.text.strip()
