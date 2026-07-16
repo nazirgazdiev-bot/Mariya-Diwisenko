@@ -206,6 +206,8 @@ class Storage:
             await db.execute("DELETE FROM dialog WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM facts WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM clients WHERE user_id = ?", (user_id,))
+            await db.execute("DELETE FROM favorites WHERE user_id = ?", (user_id,))
+            await db.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
             await db.commit()
 
     # ---------- Подписки / воронка ----------

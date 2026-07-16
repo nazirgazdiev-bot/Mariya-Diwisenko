@@ -175,6 +175,10 @@ FUNNEL_TEST_INTERVAL = int(os.environ.get("FUNNEL_TEST_INTERVAL_SEC", "300"))
 # Заодно этот режим открывает /testpay всем (чтобы Назир мог сам выдать
 # себе доступ и посмотреть рецепты/МарИИю и серию после оплаты).
 RENEWAL_TEST_INTERVAL = int(os.environ.get("RENEWAL_TEST_INTERVAL_SEC", "0"))
+# Открывает команду /testpay ВСЕМ (а не только админу) на время теста —
+# чтобы Назир и Мария могли сами выдать себе доступ. ОБЯЗАТЕЛЬНО выключить
+# (TESTPAY_OPEN=0 или удалить) перед боевым запуском с реальным ботом.
+TESTPAY_OPEN = os.environ.get("TESTPAY_OPEN", "0") == "1"
 
 def dbg_delay(real_delay):
     """В тестовом режиме подменяет реальную задержку на FUNNEL_TEST_INTERVAL."""
@@ -545,6 +549,7 @@ _diag = {
 _diag["funnel_test_mode"] = FUNNEL_TEST_MODE
 _diag["funnel_test_interval_sec"] = FUNNEL_TEST_INTERVAL if FUNNEL_TEST_MODE else None
 _diag["renewal_test_interval_sec"] = RENEWAL_TEST_INTERVAL if RENEWAL_TEST_INTERVAL > 0 else None
+_diag["testpay_open"] = TESTPAY_OPEN
 
 
 # ─── Воронка продаж: логика ───────────────────────────────────────────────────
@@ -991,7 +996,7 @@ async def cmd_testpay(message: Message):
     if not storage:
         return
     is_admin = ADMIN_USER_ID and str(message.from_user.id) == ADMIN_USER_ID
-    if not is_admin and RENEWAL_TEST_INTERVAL <= 0:
+    if not is_admin and not TESTPAY_OPEN and RENEWAL_TEST_INTERVAL <= 0:
         return
     parts = message.text.split()
     tier = parts[1] if len(parts) > 1 else "1m"
