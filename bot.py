@@ -26,7 +26,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 DB_PATH = os.environ.get("DB_PATH", "mariya_data.db")
 MENU_PATH = os.environ.get("MENU_PATH", "menu.json")
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID")  # для тестовой команды /testpay
 PRODAMUS_SECRET_KEY = os.environ.get("PRODAMUS_SECRET_KEY")
 PRODAMUS_SHOP_URL = os.environ.get("PRODAMUS_SHOP_URL", "https://pprecepty.payform.ru/")
@@ -56,7 +56,7 @@ CATEGORIES = list(STRUCTURE.keys())
 def main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🍽 Рецепты")],
+            [KeyboardButton(text="🍽 Рецепты"), KeyboardButton(text="⭐ Избранное")],
             [KeyboardButton(text="🤖 Спросить МарИИю")],
         ],
         resize_keyboard=True,
@@ -93,10 +93,15 @@ def recipes_keyboard(cat_idx: int, sub_idx: int):
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"back:cat:{cat_idx}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def recipe_keyboard(cat_idx: int, sub_idx: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад к списку", callback_data=f"back:sub:{cat_idx}:{sub_idx}")]
-    ])
+def recipe_keyboard(cat_idx: int, sub_idx: int, recipe_id: str | None = None, is_fav: bool = False):
+    rows = []
+    if recipe_id is not None:
+        rows.append([InlineKeyboardButton(
+            text="💛 В избранном" if is_fav else "⭐ В избранное",
+            callback_data=f"fav:{'del' if is_fav else 'add'}:{recipe_id}",
+        )])
+    rows.append([InlineKeyboardButton(text="◀️ Назад к списку", callback_data=f"back:sub:{cat_idx}:{sub_idx}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ─── Фото рецептов ────────────────────────────────────────────────────────────
 
@@ -1004,6 +1009,57 @@ async def cmd_testpay(message: Message):
 
 # ─── Меню рецептов ────────────────────────────────────────────────────────────
 
+@dp.callback_query(F.data.startswith("fav:"))
+async def toggle_favorite(callback: CallbackQuery):
+    if not await has_access(str(callback.from_user.id)):
+        await callback.answer()
+        await send_tariff_card(callback.message.chat.id)
+        return
+    _, action, recipe_id = callback.data.split(":", 2)
+    uid = str(callback.from_user.id)
+    if action == "add":
+        await storage.add_favorite(uid, recipe_id)
+        is_fav = True
+        note = "Добавлено в избранное ⭐"
+    else:
+        await storage.remove_favorite(uid, recipe_id)
+        is_fav = False
+        note = "Убрано из избранного"
+    recipe = RECIPES.get(recipe_id)
+    if recipe:
+        cat_idx, sub_idx = find_cat_sub_for_recipe(recipe)
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=recipe_keyboard(cat_idx, sub_idx, recipe_id, is_fav)
+            )
+        except Exception:
+            pass
+    await callback.answer(note)
+
+@dp.message(F.text == "⭐ Избранное")
+async def show_favorites(message: Message):
+    if not await has_access(str(message.from_user.id)):
+        await send_tariff_card(message.chat.id)
+        return
+    fav_ids = [r for r in await storage.get_favorites(str(message.from_user.id)) if r in RECIPES]
+    if not fav_ids:
+        await message.answer(
+            "⭐ <b>Избранное пустое</b>\n\n"
+            "Открой любой рецепт и нажми «⭐ В избранное» — он появится здесь, "
+            "чтобы был всегда под рукой."
+        )
+        return
+    buttons = []
+    for rid in fav_ids:
+        name = RECIPES[rid]["name"]
+        if len(name) > 40:
+            name = name[:37] + "..."
+        buttons.append([InlineKeyboardButton(text=name, callback_data=f"rec:{rid}")])
+    await message.answer(
+        "⭐ <b>Твоё избранное:</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
 @dp.message(F.text == "🍽 Рецепты")
 async def show_categories(message: Message):
     if not await has_access(str(message.from_user.id)):
@@ -1054,6 +1110,7 @@ async def show_recipe(callback: CallbackQuery):
         return
     cat_idx, sub_idx = find_cat_sub_for_recipe(recipe)
     text = format_recipe(recipe)
+    is_fav = await storage.is_favorite(str(callback.from_user.id), recipe_id) if storage else False
     try:
         await callback.message.delete()
     except Exception:
@@ -1074,7 +1131,7 @@ async def show_recipe(callback: CallbackQuery):
                 await callback.message.answer_photo(
                     FSInputFile(photo_path),
                     caption=text,
-                    reply_markup=recipe_keyboard(cat_idx, sub_idx),
+                    reply_markup=recipe_keyboard(cat_idx, sub_idx, recipe_id, is_fav),
                     protect_content=True,
                 )
                 photo_sent_with_caption = True
@@ -1090,7 +1147,7 @@ async def show_recipe(callback: CallbackQuery):
     if not photo_sent_with_caption:
         await callback.message.answer(
             text,
-            reply_markup=recipe_keyboard(cat_idx, sub_idx),
+            reply_markup=recipe_keyboard(cat_idx, sub_idx, recipe_id, is_fav),
             protect_content=True,
         )
     await callback.answer()

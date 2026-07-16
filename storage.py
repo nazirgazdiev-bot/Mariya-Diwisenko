@@ -68,6 +68,16 @@ class Storage:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_subs_funnel ON subscriptions(funnel_next_at)"
             )
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS favorites (
+                    user_id TEXT NOT NULL,
+                    recipe_id TEXT NOT NULL,
+                    created_at TEXT,
+                    PRIMARY KEY (user_id, recipe_id)
+                )""")
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fav_user ON favorites(user_id, created_at)"
+            )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_subs_renewal ON subscriptions(renewal_next_at)"
             )
@@ -327,3 +337,38 @@ class Storage:
             ) as cur:
                 rows = await cur.fetchall()
         return [self._sub_row(r) for r in rows]
+
+    # ---------- Избранное ----------
+
+    async def add_favorite(self, user_id: str, recipe_id: str):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO favorites (user_id, recipe_id, created_at) VALUES (?, ?, ?)",
+                (user_id, recipe_id, self._now()),
+            )
+            await db.commit()
+
+    async def remove_favorite(self, user_id: str, recipe_id: str):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "DELETE FROM favorites WHERE user_id = ? AND recipe_id = ?",
+                (user_id, recipe_id),
+            )
+            await db.commit()
+
+    async def is_favorite(self, user_id: str, recipe_id: str) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT 1 FROM favorites WHERE user_id = ? AND recipe_id = ?",
+                (user_id, recipe_id),
+            ) as cur:
+                return await cur.fetchone() is not None
+
+    async def get_favorites(self, user_id: str) -> list[str]:
+        """Список recipe_id в избранном, новые сверху."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT recipe_id FROM favorites WHERE user_id = ? ORDER BY created_at DESC",
+                (user_id,),
+            ) as cur:
+                return [r[0] for r in await cur.fetchall()]

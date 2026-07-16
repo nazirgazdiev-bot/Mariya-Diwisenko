@@ -343,7 +343,7 @@ class Mariya:
         self,
         anthropic_key: str,
         recipes_data: dict,
-        model: str = "claude-sonnet-4-6",
+        model: str = "claude-haiku-4-5-20251001",
         learn_model: str = "claude-haiku-4-5-20251001",
     ):
         self.client = AsyncAnthropic(api_key=anthropic_key)
