@@ -870,12 +870,7 @@ async def cmd_start(message: Message):
         return
 
     sub = await storage.get_subscription(uid)
-    if sub is None:
-        # Новый юзер — запускаем воронку: шаг 1 через 5 секунд
-        await storage.upsert_subscription(uid, status="trial", funnel_step=0)
-        await send_welcome(message.chat.id)
-        await storage.set_funnel_step(uid, 1, iso_in(5))
-    elif await has_access(uid):
+    if await has_access(uid):
         await message.answer(
             "👋 Привет! Это сборник полезных рецептов Марии Дивисенко.\n\n"
             "🍽 <b>Рецепты</b> — просматривать 250+ рецептов по категориям\n"
@@ -884,9 +879,13 @@ async def cmd_start(message: Message):
             reply_markup=main_keyboard(),
         )
     else:
-        # Запись есть, но не оплачено — приветствуем и сразу показываем тарифы
+        # Новый юзер ИЛИ есть запись, но не оплачено — (пере)запускаем воронку
+        # с самого начала: приветствие → (через 5 сек) видео-шаг → (через
+        # 15 сек) карточка "Что ты получишь". НЕ показываем тарифы сразу —
+        # они идут только по кнопке / в свой черёд по воронке.
+        await storage.upsert_subscription(uid, status="trial", funnel_step=0)
         await send_welcome(message.chat.id)
-        await send_tariff_card(message.chat.id)
+        await storage.set_funnel_step(uid, 1, iso_in(5))
 
 @dp.message(Command("profile"))
 async def cmd_profile(message: Message):
