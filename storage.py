@@ -60,40 +60,36 @@ class Storage:
                     funnel_step INTEGER NOT NULL DEFAULT 0,
                     funnel_next_at TEXT,
                     renewal_reminder_sent INTEGER NOT NULL DEFAULT 0,
-                    renewal_stage INTEGER NOT NULL DEFAULT 0,
-                    renewal_next_at TEXT,
+                    blocked INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT,
                     updated_at TEXT
                 )""")
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_subs_funnel ON subscriptions(funnel_next_at)"
             )
+            # Миграция для баз, созданных до появления колонки blocked
+            # (заблокировал ли юзер бота — отдельный флаг, не статус подписки).
+            try:
+                await db.execute(
+                    "ALTER TABLE subscriptions ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0"
+                )
+            except Exception:
+                pass  # колонка уже есть — это ожидаемо для существующих баз
+
             await db.execute("""
-                CREATE TABLE IF NOT EXISTS favorites (
-                    user_id TEXT NOT NULL,
-                    recipe_id TEXT NOT NULL,
-                    created_at TEXT,
-                    PRIMARY KEY (user_id, recipe_id)
+                CREATE TABLE IF NOT EXISTS payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT,
+                    tier TEXT,
+                    amount REAL,
+                    commission_sum REAL,
+                    order_id TEXT,
+                    status TEXT,
+                    created_at TEXT
                 )""")
             await db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_fav_user ON favorites(user_id, created_at)"
+                "CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id, id)"
             )
-            await db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_subs_renewal ON subscriptions(renewal_next_at)"
-            )
-            # Миграция для баз, созданных до появления многошаговой воронки
-            # продления (renewal_stage/renewal_next_at) — ADD COLUMN IF NOT EXISTS
-            # для sqlite делаем вручную через PRAGMA table_info.
-            async with db.execute("PRAGMA table_info(subscriptions)") as cur:
-                existing_cols = {row[1] for row in await cur.fetchall()}
-            if "renewal_stage" not in existing_cols:
-                await db.execute(
-                    "ALTER TABLE subscriptions ADD COLUMN renewal_stage INTEGER NOT NULL DEFAULT 0"
-                )
-            if "renewal_next_at" not in existing_cols:
-                await db.execute(
-                    "ALTER TABLE subscriptions ADD COLUMN renewal_next_at TEXT"
-                )
             await db.commit()
 
     @staticmethod
@@ -206,16 +202,13 @@ class Storage:
             await db.execute("DELETE FROM dialog WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM facts WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM clients WHERE user_id = ?", (user_id,))
-            await db.execute("DELETE FROM favorites WHERE user_id = ?", (user_id,))
-            await db.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
             await db.commit()
 
     # ---------- Подписки / воронка ----------
 
     _SUB_FIELDS = (
         "user_id", "status", "tier", "paid_until",
-        "funnel_step", "funnel_next_at", "renewal_reminder_sent",
-        "renewal_stage", "renewal_next_at",
+        "funnel_step", "funnel_next_at", "renewal_reminder_sent", "blocked",
         "created_at", "updated_at",
     )
     _SUB_SELECT = "SELECT " + ", ".join(_SUB_FIELDS) + " FROM subscriptions"
@@ -242,8 +235,7 @@ class Storage:
         funnel_step=_UNSET,
         funnel_next_at=_UNSET,
         renewal_reminder_sent=_UNSET,
-        renewal_stage=_UNSET,
-        renewal_next_at=_UNSET,
+        blocked=_UNSET,
     ):
         """Частичное обновление: меняются только переданные поля.
         Явный None допустим (например funnel_next_at=None очищает дату)."""
@@ -255,8 +247,7 @@ class Storage:
             "funnel_step": funnel_step,
             "funnel_next_at": funnel_next_at,
             "renewal_reminder_sent": renewal_reminder_sent,
-            "renewal_stage": renewal_stage,
-            "renewal_next_at": renewal_next_at,
+            "blocked": blocked,
         }
         fields = {k: v for k, v in passed.items() if v is not _UNSET}
         async with aiosqlite.connect(self.db_path) as db:
@@ -278,20 +269,17 @@ class Storage:
                     "funnel_step": 0,
                     "funnel_next_at": None,
                     "renewal_reminder_sent": 0,
-                    "renewal_stage": 0,
-                    "renewal_next_at": None,
+                    "blocked": 0,
                 }
                 values.update(fields)
                 await db.execute(
                     """INSERT INTO subscriptions
                        (user_id, status, tier, paid_until, funnel_step,
-                        funnel_next_at, renewal_reminder_sent,
-                        renewal_stage, renewal_next_at, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        funnel_next_at, renewal_reminder_sent, blocked, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (user_id, values["status"], values["tier"], values["paid_until"],
                      values["funnel_step"], values["funnel_next_at"],
-                     values["renewal_reminder_sent"], values["renewal_stage"],
-                     values["renewal_next_at"], now, now),
+                     values["renewal_reminder_sent"], values["blocked"], now, now),
                 )
             await db.commit()
 
@@ -311,18 +299,17 @@ class Storage:
                 rows = await cur.fetchall()
         return [self._sub_row(r) for r in rows]
 
-    async def due_renewal_users(self, now_iso: str) -> list[dict]:
-        """Кому пора слать следующий шаг многоступенчатой воронки продления
-        (за 3 дня / за 1 день / в день списания / за 1 час / win-back —
-        см. RENEWAL_STAGES в bot.py). Работает по точному времени
-        renewal_next_at, а не по флагу "уже отправлено", так что не зависит
-        от статуса (active/expired) — win-back шлётся уже после истечения."""
+    async def expiring_subscriptions(self, now_iso: str, deadline_iso: str) -> list[dict]:
+        """Активные подписки, которые истекают до deadline и ещё не получали напоминание."""
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
                 f"""{self._SUB_SELECT}
-                    WHERE renewal_next_at IS NOT NULL
-                      AND renewal_next_at <= ?""",
-                (now_iso,),
+                    WHERE status = 'active'
+                      AND paid_until IS NOT NULL
+                      AND paid_until > ?
+                      AND paid_until <= ?
+                      AND renewal_reminder_sent = 0""",
+                (now_iso, deadline_iso),
             ) as cur:
                 rows = await cur.fetchall()
         return [self._sub_row(r) for r in rows]
@@ -340,37 +327,118 @@ class Storage:
                 rows = await cur.fetchall()
         return [self._sub_row(r) for r in rows]
 
-    # ---------- Избранное ----------
+    async def subscriber_counts(self) -> dict:
+        """Подсчёт подписчиков по статусам.
+        Всегда содержит ключи active/trial/expired (0, если никого нет),
+        плюс любые другие статусы, если вдруг появятся."""
+        counts = {"active": 0, "trial": 0, "expired": 0}
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT status, COUNT(*) FROM subscriptions GROUP BY status"
+            ) as cur:
+                rows = await cur.fetchall()
+        for status, cnt in rows:
+            counts[status] = cnt
+        return counts
 
-    async def add_favorite(self, user_id: str, recipe_id: str):
+    # ---------- Блокировка бота юзером ----------
+
+    async def set_blocked(self, user_id: str, blocked: bool):
+        """Отдельный флаг (не путать со status): юзер заблокировал бота в Telegram.
+        Не трогает status/tier/paid_until — платящий юзер, временно заблокировавший
+        бота и потом разблокировавший его, не теряет доступ."""
+        await self.upsert_subscription(user_id, blocked=1 if blocked else 0)
+
+    # ---------- Платежи (история — источник метрик "продлил/не продлил") ----------
+
+    async def add_payment(
+        self,
+        user_id: str,
+        tier: str,
+        amount: float | None,
+        commission_sum: float | None,
+        order_id: str | None,
+        status: str = "success",
+    ):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "INSERT OR IGNORE INTO favorites (user_id, recipe_id, created_at) VALUES (?, ?, ?)",
-                (user_id, recipe_id, self._now()),
+                """INSERT INTO payments
+                   (user_id, tier, amount, commission_sum, order_id, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, tier, amount, commission_sum, order_id, status, self._now()),
             )
             await db.commit()
 
-    async def remove_favorite(self, user_id: str, recipe_id: str):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "DELETE FROM favorites WHERE user_id = ? AND recipe_id = ?",
-                (user_id, recipe_id),
-            )
-            await db.commit()
+    # ---------- Сегменты для рассылок ----------
 
-    async def is_favorite(self, user_id: str, recipe_id: str) -> bool:
+    async def users_in_segment(self, status: str | None) -> list[str]:
+        """user_id всех незаблокировавших бота юзеров. status=None — все,
+        иначе фильтр по конкретному статусу подписки (active/trial/expired)."""
         async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                "SELECT 1 FROM favorites WHERE user_id = ? AND recipe_id = ?",
-                (user_id, recipe_id),
-            ) as cur:
-                return await cur.fetchone() is not None
+            if status is None:
+                query = "SELECT user_id FROM subscriptions WHERE blocked = 0"
+                params: tuple = ()
+            else:
+                query = "SELECT user_id FROM subscriptions WHERE blocked = 0 AND status = ?"
+                params = (status,)
+            async with db.execute(query, params) as cur:
+                rows = await cur.fetchall()
+        return [r[0] for r in rows]
 
-    async def get_favorites(self, user_id: str) -> list[str]:
-        """Список recipe_id в избранном, новые сверху."""
+    # ---------- Метрики для дашборда Google Sheets ----------
+
+    async def dashboard_metrics(self) -> dict:
+        """Все счётчики для листа «Дашборд»:
+        всего зашло / активных / пробных / истёкших / заблокировавших /
+        оплативших хотя бы раз / продливших / оплативших но не продливших.
+
+        "Продлил" — у юзера >= 2 успешных платежей.
+        "Не продлил" — у юзера ровно 1 успешный платёж И его подписка сейчас
+        expired (то есть первый оплаченный период уже закончился, а нового
+        платежа не было). Если платёж один и подписка ещё active — юзер
+        просто не успел продлить, это не считаем "не продлил"."""
         async with aiosqlite.connect(self.db_path) as db:
+            counts = {"active": 0, "trial": 0, "expired": 0}
             async with db.execute(
-                "SELECT recipe_id FROM favorites WHERE user_id = ? ORDER BY created_at DESC",
-                (user_id,),
+                "SELECT status, COUNT(*) FROM subscriptions GROUP BY status"
             ) as cur:
-                return [r[0] for r in await cur.fetchall()]
+                for status, cnt in await cur.fetchall():
+                    if status in counts:
+                        counts[status] = cnt
+
+            async with db.execute("SELECT COUNT(*) FROM subscriptions") as cur:
+                total_registered = (await cur.fetchone())[0]
+
+            async with db.execute(
+                "SELECT COUNT(*) FROM subscriptions WHERE blocked = 1"
+            ) as cur:
+                blocked = (await cur.fetchone())[0]
+
+            paid_at_least_once = 0
+            renewed = 0
+            not_renewed = 0
+            async with db.execute(
+                """SELECT p.user_id, COUNT(*), MAX(s.status)
+                   FROM payments p
+                   LEFT JOIN subscriptions s ON s.user_id = p.user_id
+                   WHERE p.status = 'success'
+                   GROUP BY p.user_id"""
+            ) as cur:
+                rows = await cur.fetchall()
+            for _user_id, pay_count, sub_status in rows:
+                paid_at_least_once += 1
+                if pay_count >= 2:
+                    renewed += 1
+                elif sub_status == "expired":
+                    not_renewed += 1
+
+        return {
+            "total_registered": total_registered,
+            "active": counts["active"],
+            "trial": counts["trial"],
+            "expired": counts["expired"],
+            "blocked": blocked,
+            "paid_at_least_once": paid_at_least_once,
+            "renewed": renewed,
+            "not_renewed": not_renewed,
+        }

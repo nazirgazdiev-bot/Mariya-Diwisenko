@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction, ParseMode
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -18,6 +19,7 @@ from dotenv import load_dotenv
 
 from mariya import Mariya
 from prodamus import ProdamusClient
+from sheets import SheetsClient
 from storage import Storage
 
 load_dotenv()
@@ -26,11 +28,15 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 DB_PATH = os.environ.get("DB_PATH", "mariya_data.db")
 MENU_PATH = os.environ.get("MENU_PATH", "menu.json")
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID")  # для тестовой команды /testpay
 PRODAMUS_SECRET_KEY = os.environ.get("PRODAMUS_SECRET_KEY")
 PRODAMUS_SHOP_URL = os.environ.get("PRODAMUS_SHOP_URL", "https://pprecepty.payform.ru/")
 WEBHOOK_PORT = int(os.environ.get("PORT", 8080))
+# Google Sheets: включается только если заданы ОБЕ переменные (аккаунт клиента, не хардкод)
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+SHEETS_SYNC_INTERVAL = 5 * 60  # секунд между обновлениями дашборда
 # Привязываем к расположению bot.py, а не к рабочему каталогу,
 # чтобы фото находились при запуске из любого CWD
 PHOTOS_DIR = os.environ.get(
@@ -56,7 +62,7 @@ CATEGORIES = list(STRUCTURE.keys())
 def main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🍽 Рецепты"), KeyboardButton(text="⭐ Избранное")],
+            [KeyboardButton(text="🍽 Рецепты")],
             [KeyboardButton(text="🤖 Спросить МарИИю")],
         ],
         resize_keyboard=True,
@@ -93,15 +99,10 @@ def recipes_keyboard(cat_idx: int, sub_idx: int):
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"back:cat:{cat_idx}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def recipe_keyboard(cat_idx: int, sub_idx: int, recipe_id: str | None = None, is_fav: bool = False):
-    rows = []
-    if recipe_id is not None:
-        rows.append([InlineKeyboardButton(
-            text="💛 В избранном" if is_fav else "⭐ В избранное",
-            callback_data=f"fav:{'del' if is_fav else 'add'}:{recipe_id}",
-        )])
-    rows.append([InlineKeyboardButton(text="◀️ Назад к списку", callback_data=f"back:sub:{cat_idx}:{sub_idx}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def recipe_keyboard(cat_idx: int, sub_idx: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад к списку", callback_data=f"back:sub:{cat_idx}:{sub_idx}")]
+    ])
 
 # ─── Фото рецептов ────────────────────────────────────────────────────────────
 
@@ -134,7 +135,7 @@ def format_recipe(recipe: dict) -> str:
         instructions = instructions[:1997] + "..."
 
     text = f"<b>🍳 {name}</b>\n\n"
-    text += "📊 <b>КБЖУ на 100г:</b>\n"
+    text += f"📊 <b>КБЖУ на 100г:</b>\n"
     text += f"🔥 {kcal} ккал  |  🥩 Б: {protein}г  |  🧈 Ж: {fat}г  |  🍞 У: {carbs}г\n\n"
     text += f"🛒 <b>Ингредиенты:</b>\n{ingredients_text}\n\n"
     text += f"👨‍🍳 <b>Приготовление:</b>\n{instructions}"
@@ -159,44 +160,30 @@ def find_cat_sub_for_recipe(recipe: dict):
 # ─── Воронка продаж: тексты, тарифы, клавиатуры ──────────────────────────────
 
 FUNNEL_CHECK_INTERVAL = 25          # секунд между проверками фоновой задачи
-
-# Тестовый режим воронки: включается переменной окружения FUNNEL_TEST_MODE=1
-# на Railway (без правки кода). Схлопывает все задержки между дожимами до
-# FUNNEL_TEST_INTERVAL_SEC секунд (по умолчанию 300 = 5 минут), чтобы можно
-# было быстро прогнать всю цепочку глазами. НЕ ЗАБЫТЬ ВЫКЛЮЧИТЬ после теста —
-# иначе в проде дожимы будут лететь раз в 5 минут вместо реальных дней.
-FUNNEL_TEST_MODE = os.environ.get("FUNNEL_TEST_MODE", "0") == "1"
-FUNNEL_TEST_INTERVAL = int(os.environ.get("FUNNEL_TEST_INTERVAL_SEC", "300"))
-
-# Отдельный тест ПОСТ-ОПЛАТНОЙ серии (продление/win-back), НЕЗАВИСИМ от
-# FUNNEL_TEST_MODE: если RENEWAL_TEST_INTERVAL_SEC > 0, то все 5 этапов
-# продления идут подряд с этим интервалом (в секундах), игнорируя реальные
-# день/час из Miro. 0 = боевой режим (реальные даты от paid_until).
-# Заодно этот режим открывает /testpay всем (чтобы Назир мог сам выдать
-# себе доступ и посмотреть рецепты/МарИИю и серию после оплаты).
-RENEWAL_TEST_INTERVAL = int(os.environ.get("RENEWAL_TEST_INTERVAL_SEC", "0"))
-# Открывает команду /testpay ВСЕМ (а не только админу) на время теста —
-# чтобы Назир и Мария могли сами выдать себе доступ. ОБЯЗАТЕЛЬНО выключить
-# (TESTPAY_OPEN=0 или удалить) перед боевым запуском с реальным ботом.
-TESTPAY_OPEN = os.environ.get("TESTPAY_OPEN", "0") == "1"
-
-def dbg_delay(real_delay):
-    """В тестовом режиме подменяет реальную задержку на FUNNEL_TEST_INTERVAL."""
-    return FUNNEL_TEST_INTERVAL if FUNNEL_TEST_MODE else real_delay
+RENEWAL_REMIND_BEFORE = 2 * 86400   # напоминать о продлении за 2 дня
 
 TIERS = {
-    "1m": {"title": "1 месяц — 1690₽", "label": "1 месяц", "days": 30, "price": 1690},
-    "3m": {"title": "3 месяца — 3990₽ (выгоднее на 20%)", "label": "3 месяца", "days": 90, "price": 3990},
-    "6m": {"title": "6 месяцев — 6990₽ (выгоднее на 30%)", "label": "6 месяцев", "days": 180, "price": 6990},
+    "1m": {"title": "1 месяц — 1690₽", "days": 30, "price": 1690},
+    "3m": {"title": "3 месяца — 3990₽ (выгоднее на 20%)", "days": 90, "price": 3990},
+    "6m": {"title": "6 месяцев — 6990₽ (выгоднее на 30%)", "days": 180, "price": 6990},
 }
 
+# Сегменты для /broadcast: ключ команды -> статус подписки (None = все).
+BROADCAST_SEGMENTS = {
+    "all": None,
+    "paid": "active",
+    "unpaid": "trial",
+    "expired": "expired",
+}
+BROADCAST_DELAY = 0.05  # ~20 сообщений/сек — с запасом от лимита Telegram (~30/сек)
+
 WELCOME_FUNNEL_TEXT = (
-    "<b>Привет! 💜 Это Мария — рада видеть тебя здесь.</b>\n\n"
+    "Привет! 💜 Это Мария — рада видеть тебя здесь.\n\n"
     "Ты зашла в моего бота с рецептами и личным ИИ-ассистентом. "
     "Тут собрано всё, чем я сама пользуюсь каждый день:\n\n"
     "250+ моих фирменных ПП-рецептов и МарИИя — умный помощник, который считает КБЖУ "
     "и собирает рационы под тебя из моего сборника рецептов\n\n"
-    "<b>Сейчас за пару минут покажу, как это работает 👋</b>"
+    "Сейчас за пару минут покажу, как это работает 👋"
 )
 
 STEP1_VIDEO_TEXT = (
@@ -206,18 +193,15 @@ STEP1_VIDEO_TEXT = (
 )
 
 TARIFF_CARD_TEXT = (
-    "<b>🔥 Что ты получишь внутри бота:</b>\n\n"
+    "🔥 Что ты получишь внутри бота:\n\n"
     "🍽 250+ моих фирменных ПП-рецептов — разбиты по категориям: завтраки, мясо, "
     "десерты и другое. Захотела — открыла — приготовила. "
     "(рецепты будут пополняться постоянно)\n\n"
     "🤖 МарИИя — мой личный ИИ-ассистент. Считает твоё КБЖУ по моему методу "
     "и собирает тебе готовый рацион на день, неделю или месяц. Под твои цели, "
     "вкусы и даже аллергии. И всё это — только из моих проверенных рецептов.\n\n"
-    "Это как иметь меня в кармане в режиме 24/7 🤍\n\n"
-    "<b>Выбирай доступ и погнали 👇</b>\n"
-    "▪️ 1 месяц — 1690 ₽\n"
-    "▪️ 3 месяца — 3990 ₽ (выгоднее на 20%)\n"
-    "▪️ 6 месяцев — 6990 ₽ (выгоднее на 30%)"
+    "Это как иметь меня в кармане в режиме 24/7 💜\n\n"
+    "Выбирай доступ и погнали 👇"
 )
 
 DOZHIM_1_TEXT = (
@@ -252,163 +236,34 @@ DOZHIM_3_TEXT = (
     "и семье. Готовишь один раз, а не стоишь у плиты круглосуточно...."
 )
 
-DOZHIM_4_TEXT = (
-    "<b>Давай честно про деньги 💬</b>\n\n"
-    "Знаю, что многих останавливает мысль: «а вдруг куплю и не буду пользоваться, "
-    "как с теми марафонами».\n\n"
-    "Я тебя понимаю. Поэтому скажу прямо: это не курс, который надо проходить, "
-    "и не марафон, где нужно успевать. Это инструмент, который просто всегда под рукой.\n\n"
-    "Захотела рецепт — открыла. Нужно меню — спросила МарИИю. Никаких дедлайнов "
-    "и чувства вины, что ты что-то не успела.\n\n"
-    "1690 ₽ в месяц — это меньше, чем ты тратишь на спонтанные продукты, которые "
-    "покупаешь, не зная что готовить, и которые потом портятся в холодильнике.\n\n"
-    "<b>Попробуй, не понравится — верну деньги 👇</b>"
-)
-
-DOZHIM_5_TEXT = (
-    "Знаю, о чём некоторые думают:\n\n"
-    "«да этот бот выдаст мне овсянку на воде, которую я есть не буду» 😄\n\n"
-    "Расслабься — МарИИя гибкая.\n\n"
-    "Не любишь рыбу? Скажи — заменит. Аллергия на молочку? Учтёт. "
-    "Хочешь сегодня что-то сладкое на завтрак? Впишет.\n\n"
-    "Ты говоришь, что любишь и что не хочешь — а она подстраивает меню под ТЕБЯ. "
-    "Мой бот — это не жёсткий план из которого хочется сбежать и сорваться. "
-    "Это питание под твои желания.\n\n"
-    "<b>Проверь сама по самым лучшим условиям сейчас 👇</b>"
-)
-
-DOZHIM_6_TEXT = (
-    "<b>Пока ты думаешь — девочки уже вовсю готовят по боту 👆</b>\n\n"
-    "Самое приятное для меня — что многие пишут одно и то же: «наконец-то я "
-    "перестала мучиться вопросом что приготовить, а вес начал уходить».\n\n"
-    "Ровно для этого всё и создавалось!\n\n"
-    "<b>Присоединяйся к нам, и готовь без гемора 😅</b>"
-)
-
-DOZHIM_7_TEXT = (
-    "<b>Последнее напоминание от меня 💔</b>\n\n"
-    "Если ты дочитала до сюда — значит, тема питания тебя правда волнует. "
-    "И ты уже устала от этого хаоса: то диета, то срыв, то «с понедельника».\n\n"
-    "Бот — это способ навести порядок в еде раз и навсегда. Без весов, без "
-    "мучений, без «что приготовить». Всё уже собрано и продумано за тебя.\n\n"
-    "Сегодня — напоминаю про вступление последний раз, далее бот отключается 💔\n\n"
-    "<b>Погнали кушать вкусно и легко 👇</b>"
-)
-
 PAID_TEXT = (
     "<b>Красотка, ты в деле! 🎉 Доступ открыт.</b>\n\n"
-    "С чего советую начать:\n\n"
-    "1️⃣ Загляни в «Рецепты» — полистай категории, сохрани в избранное что приглянулось\n\n"
+    "С чего советую начать:\n"
+    "1️⃣ Загляни в «Рецепты» — полистай категории, сохрани в избранное что приглянулось\n"
     "2️⃣ Нажми «Спросить МарИИю» и попроси собрать тебе рацион на день/неделю — "
     "просто напиши свою цель (любимые продукты, на что аллергия, свою цель и КБЖУ)\n\n"
-    "<i>P.s. если не знаешь КБЖУ МарИИя также сможет рассчитать тебе его, просто напиши "
+    "P.s. если не знаешь КБЖУ МарИИя тоже сможет рассчитать тебе его, просто напиши "
     "свой рост/вес, цель (похудение, набор) и желаемый вес, МарИИя высчитает КБЖУ "
-    "под тебя по моей методике!</i>\n\n"
+    "под тебя по моей методике!\n\n"
     "<b>Пользуйся в удовольствие. Я вложила сюда всю свою систему питания — "
-    "теперь она твоя 🤍</b>"
+    "теперь она твоя 💫</b>"
 )
 
-# ─── Воронка продления (после оплаты) — сверено с Miro 2026-07-15 ────────────
-# Расписание считается от paid_until (см. renewal_target_msk), не от текущего
-# момента — переживает рестарты бота и правильно работает даже если сервис
-# не поднимался в момент, когда должно было прийти напоминание.
-
-RENEWAL_3D_TEXT = (
-    "<b>Привет! 🤍 Напоминаю: твой доступ к боту заканчивается через 3 дня</b>\n\n"
-    "За это время МарИИя наверняка стала твоим помощником — считала КБЖУ, "
-    "собирала меню, избавляла от вечного «что готовить».\n\n"
-    "<b>Чтобы ничего из этого не потерять — продли доступ заранее 👇</b>\n\n"
-    "▪️ 1 месяц — 1690₽\n"
-    "▪️ 3 месяца — 3990₽ (выгоднее на 20%)\n"
-    "▪️ 6 месяцев — 6990₽ (выгоднее на 30%)"
+# TODO: точный текст пришлёт Мария — пока нейтральная заглушка
+RENEWAL_TEXT = (
+    "⏰ Твоя подписка скоро закончится — вместе с ней закроется доступ к рецептам "
+    "и МарИИе.\n\nЧтобы ничего не потерять, продли доступ заранее 👇"
 )
-
-RENEWAL_1D_TEXT = (
-    "<b>Твой доступ закрывается уже завтра ⏳</b>\n\n"
-    "Совсем скоро рецепты и МарИИя станут недоступны. А значит — снова считать "
-    "самой, снова ломать голову над меню, снова этот вопрос «что бы приготовить».\n\n"
-    "<b>Не возвращайся к хаосу — продли за пару секунд 👇</b>"
-)
-
-RENEWAL_DAYOF_TEXT = (
-    "<b>Сегодня последний день твоего доступа 🤍</b>\n\n"
-    "После полуночи бот закроется. Если хочешь и дальше готовить по моим "
-    "рецептам и держать питание под контролем с МарИИей — самое время продлить.\n\n"
-    "<b>Одно нажатие — и остаёшься с помощником 👇</b>"
-)
-
-RENEWAL_1H_TEXT = (
-    "<b>⏰ Остался час.</b>\n\n"
-    "Через час доступ закроется, и МарИИя попрощается с тобой. Если не "
-    "успеешь продлить — придётся начинать оплату заново позже.\n\n"
-    "<b>Сохрани доступ прямо сейчас, и перестань париться о том что приготовить, "
-    "это займёт 10 секунд 👇</b>"
-)
-
-RENEWAL_WINBACK_TEXT = (
-    "<b>Скучаешь по МарИИе?</b>\n\n"
-    "🤍Твой доступ закрылся пару дней назад. Если поймала себя на том, что "
-    "снова не знаешь что приготовить и считаешь всё вручную — возвращайся, "
-    "я всегда тебе рада.\n\n"
-    "Если все таки решишься вернуться — у меня для тебя небольшой подарок 🎁\n\n"
-    "При возобновлении подписки на бота — тренировочный комплекс для зала "
-    "в подарок)\n\n"
-    "<b>Вернуться к рецептам и МарИИе и получить бонус 👇</b>"
-)
-
-NEW_TARIFF_TEXT_TMPL = (
-    "<b>🤍 {name}, выбери тариф для оформления подписки:</b>\n\n"
-    "▪️ 1 месяц — 1690₽\n"
-    "▪️ 3 месяца — 3990₽ (выгоднее на 20%)\n"
-    "▪️ 6 месяцев — 6990₽ (выгоднее на 30%)"
-)
-
-RENEWAL_TARIFF_TEXT_TMPL = (
-    "<b>🤍 {name}, выбери тариф для продления подписки:</b>\n\n"
-    "▪️ 1 месяц — 1690₽\n"
-    "▪️ 3 месяца — 3990₽ (выгоднее на 20%)\n"
-    "▪️ 6 месяцев — 6990₽ (выгоднее на 30%)"
-)
-
-# Этап 1: за 3 дня в 12:00 МСК | 2: за 1 день в 12:00 МСК |
-# 3: в день списания в 10:00 МСК | 4: за 1 час до отключения (23:00 МСК того
-# же дня — ровно за час до полуночного отключения) | 5: win-back через 2 дня
-# после окончания подписки в 12:00 МСК.
-RENEWAL_STAGE_TEXTS = {
-    1: RENEWAL_3D_TEXT,
-    2: RENEWAL_1D_TEXT,
-    3: RENEWAL_DAYOF_TEXT,
-    4: RENEWAL_1H_TEXT,
-    5: RENEWAL_WINBACK_TEXT,
-}
-RENEWAL_STAGE_PHOTOS = {
-    1: "renewal_3days.png",
-    2: "renewal_1day.png",
-    3: "renewal_dayof.png",
-    4: None,  # в Miro у этой карточки нет картинки — только текст
-    5: "renewal_winback.png",
-}
 
 
 def tariffs_keyboard():
-    """Кнопки выбора тарифа — по просьбе Кирилла 2026-07-16 БЕЗ цены/выгоды
-    в самой кнопке (это идёт только в тексте сообщения над кнопками)."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=TIERS[t]["label"], callback_data=f"tier:{t}")]
+        [InlineKeyboardButton(text=TIERS[t]["title"], callback_data=f"tier:{t}")]
         for t in ("1m", "3m", "6m")
     ])
 
 def pay_cta_keyboard(text: str):
-    """Кнопка дожимов (3-9) и кнопка самой TARIFF_CARD_TEXT — ведёт СРАЗУ на
-    карточку выбора тарифа для НОВОЙ подписки ("🤍 Имя, выбери тариф для
-    оформления подписки"), минуя повторный показ TARIFF_CARD_TEXT."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=text, callback_data="show_new_tariffs")]
-    ])
-
-def intro_cta_keyboard(text: str):
-    """Кнопка ТОЛЬКО у шага 1 (видео-текст) — ведёт на TARIFF_CARD_TEXT
-    (шаг 2, "🔥 Что ты получишь внутри бота"), а не сразу на тарифы."""
+    """Одна кнопка, ведущая на карточку с тарифами."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=text, callback_data="show_tariffs")]
     ])
@@ -419,69 +274,6 @@ def now_utc() -> datetime:
 
 def iso_in(seconds: float) -> str:
     return (now_utc() + timedelta(seconds=seconds)).isoformat()
-
-MSK = timezone(timedelta(hours=3))
-
-def seconds_until_msk(days_ahead: int, hour: int, minute: int = 0) -> float:
-    """Секунд от текущего момента до `hour:minute` по МСК через `days_ahead`
-    календарных дней (от сегодняшней даты по МСК). Нужно для гибридной
-    относительно-абсолютной схемы дожимов из Miro (день N в HH:MM МСК),
-    которая идёт после первых трёх дожимов на чистых относительных задержках."""
-    now_msk = now_utc().astimezone(MSK)
-    target_date = (now_msk + timedelta(days=days_ahead)).date()
-    target = datetime(
-        target_date.year, target_date.month, target_date.day,
-        hour, minute, tzinfo=MSK,
-    )
-    return max((target - now_msk).total_seconds(), 60.0)
-
-
-def renewal_target_msk(paid_until_iso: str, stage: int) -> datetime | None:
-    """Абсолютное время (МСК) очередного этапа воронки продления, считая от
-    даты окончания подписки paid_until. Стадии 1-5 — см. RENEWAL_STAGE_TEXTS."""
-    paid_dt = datetime.fromisoformat(paid_until_iso)
-    if paid_dt.tzinfo is None:
-        paid_dt = paid_dt.replace(tzinfo=timezone.utc)
-    base_date = paid_dt.astimezone(MSK).date()
-    if stage == 1:
-        d, h, m = base_date - timedelta(days=3), 12, 0
-    elif stage == 2:
-        d, h, m = base_date - timedelta(days=1), 12, 0
-    elif stage == 3:
-        d, h, m = base_date, 10, 0
-    elif stage == 4:
-        d, h, m = base_date, 23, 0
-    elif stage == 5:
-        d, h, m = base_date + timedelta(days=2), 12, 0
-    else:
-        return None
-    return datetime(d.year, d.month, d.day, h, m, tzinfo=MSK)
-
-
-def next_renewal_schedule(paid_until_iso: str, from_stage: int) -> tuple[int, str] | None:
-    """Ищет ближайший ещё не наступивший этап продления начиная с from_stage.
-    Пропускает этапы, чьё время уже прошло (короткий тариф, тестовая оплата
-    через /testpay и т.п.), чтобы не заваливать пользователя просроченными
-    напоминаниями. None — этапы закончились (после win-back)."""
-    now = now_utc()
-    if RENEWAL_TEST_INTERVAL > 0 and from_stage <= 5:
-        # Тест пост-оплатной серии: игнорируем реальные день/час из Miro,
-        # следующий этап через RENEWAL_TEST_INTERVAL секунд.
-        return from_stage, (now + timedelta(seconds=RENEWAL_TEST_INTERVAL)).isoformat()
-    for stage in range(from_stage, 6):
-        target_msk = renewal_target_msk(paid_until_iso, stage)
-        if target_msk is None:
-            continue
-        target_utc = target_msk.astimezone(timezone.utc)
-        if target_utc > now:
-            return stage, target_utc.isoformat()
-    return None
-
-
-def renewal_cta_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Продлить подписку ✅", callback_data="show_renewal_tariffs")]
-    ])
 
 
 prodamus_client = ProdamusClient(PRODAMUS_SECRET_KEY or "", PRODAMUS_SHOP_URL) if PRODAMUS_SECRET_KEY else None
@@ -522,6 +314,41 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher()
 storage: Storage = None
 mariya: Mariya = None
+sheets_client: SheetsClient | None = None
+
+
+async def _sheets_log_payment(user_id: str, tier: str, amount, commission_sum, status: str, order_id: str):
+    """gspread синхронный — уводим вызов в поток, чтобы не блокировать event loop."""
+    if not sheets_client:
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(
+            None, sheets_client.log_payment, user_id, tier, amount, commission_sum, status, order_id
+        )
+    except Exception:
+        log.exception("Не удалось записать платёж в Google Sheets user_id=%s order_id=%s", user_id, order_id)
+
+
+async def _sheets_write_dashboard():
+    if not sheets_client or not storage:
+        return
+    try:
+        metrics = await storage.dashboard_metrics()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, sheets_client.write_dashboard_snapshot, metrics)
+    except Exception:
+        log.exception("Не удалось обновить дашборд Google Sheets")
+
+
+def _to_float(value) -> float | None:
+    """Продамус присылает числа строками ('1690.00' и т.п.) — безопасный парсинг."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 # ─── Диагностика поллинга и вебхука (временно, чтобы обойти проблему с логами Railway) ──
 _diag = {
@@ -534,22 +361,11 @@ _diag = {
     "last_webhook_at": None,
     "last_webhook_raw": None,
     "last_webhook_sig_valid": None,
-    "last_webhook_sign_header": None,
-    "last_webhook_expected_sig": None,
     "last_webhook_order_num": None,
     "last_webhook_status": None,
     "last_webhook_result": None,
     "last_payment_link_order_id": None,
-    "last_funnel_error": None,
-    "last_funnel_error_step": None,
-    "last_funnel_error_at": None,
-    "last_funnel_step_sent": None,
-    "funnel_test_mode": None,  # выставится ниже, после чтения FUNNEL_TEST_MODE
 }
-_diag["funnel_test_mode"] = FUNNEL_TEST_MODE
-_diag["funnel_test_interval_sec"] = FUNNEL_TEST_INTERVAL if FUNNEL_TEST_MODE else None
-_diag["renewal_test_interval_sec"] = RENEWAL_TEST_INTERVAL if RENEWAL_TEST_INTERVAL > 0 else None
-_diag["testpay_open"] = TESTPAY_OPEN
 
 
 # ─── Воронка продаж: логика ───────────────────────────────────────────────────
@@ -567,146 +383,56 @@ async def has_access(user_id: str) -> bool:
         return False
     return True
 
-async def send_welcome(chat_id: int):
-    """Приветственное сообщение — первое, что видит юзер. Если есть фото-обложка
-    (photos/step1_intro.jpg), крепим его сюда с подписью вместо отдельного фото
-    и отдельного текста."""
-    welcome_photo = os.path.join(PHOTOS_DIR, "step1_intro.jpg")
-    if os.path.exists(welcome_photo):
-        await bot.send_photo(
-            chat_id, FSInputFile(welcome_photo),
-            caption=WELCOME_FUNNEL_TEXT, reply_markup=main_keyboard(),
-        )
-    else:
-        await bot.send_message(chat_id, WELCOME_FUNNEL_TEXT, reply_markup=main_keyboard())
-
 async def send_tariff_card(chat_id: int):
-    """Шаг 2 воронки — маркетинговая карточка '🔥 Что ты получишь внутри
-    бота' + tariff_card.png. Кнопка на ней ведёт на карточку выбора тарифа
-    (show_new_tariffs), а не на оплату напрямую."""
-    tariff_photo = os.path.join(PHOTOS_DIR, "tariff_card.png")
-    kb = pay_cta_keyboard("Оплатить доступ ✅")
-    if os.path.exists(tariff_photo):
-        await bot.send_photo(chat_id, FSInputFile(tariff_photo), caption=TARIFF_CARD_TEXT, reply_markup=kb)
-    else:
-        await bot.send_message(chat_id, TARIFF_CARD_TEXT, reply_markup=kb)
-
-async def send_new_tariff_card(chat_id: int, name: str | None):
-    """Карточка выбора тарифа для НОВОЙ подписки ('для оформления', фото
-    new_tariff_card.png — 'Выбери тариф для подписки') — шлют сюда шаг 2
-    (по кнопке 'Оплатить доступ') и все дожимы 3-9. Отдельная от карточки
-    продления, у неё своё фото и текст."""
-    text = NEW_TARIFF_TEXT_TMPL.format(name=name or "Привет")
-    new_tariff_photo = os.path.join(PHOTOS_DIR, "new_tariff_card.png")
-    if os.path.exists(new_tariff_photo):
-        await bot.send_photo(chat_id, FSInputFile(new_tariff_photo), caption=text, reply_markup=tariffs_keyboard())
-    else:
-        await bot.send_message(chat_id, text, reply_markup=tariffs_keyboard())
-
-async def send_renewal_tariff_card(chat_id: int, name: str | None):
-    text = RENEWAL_TARIFF_TEXT_TMPL.format(name=name or "Привет")
-    photo_path = os.path.join(PHOTOS_DIR, "renewal_tariff_card.png")
-    if os.path.exists(photo_path):
-        await bot.send_photo(chat_id, FSInputFile(photo_path), caption=text, reply_markup=tariffs_keyboard())
-    else:
-        await bot.send_message(chat_id, text, reply_markup=tariffs_keyboard())
-
-async def send_renewal_stage(chat_id: int, stage: int):
-    text = RENEWAL_STAGE_TEXTS[stage]
-    photo_name = RENEWAL_STAGE_PHOTOS.get(stage)
-    kb = renewal_cta_keyboard()
-    if photo_name:
-        photo_path = os.path.join(PHOTOS_DIR, photo_name)
-        if os.path.exists(photo_path):
-            await bot.send_photo(chat_id, FSInputFile(photo_path), caption=text, reply_markup=kb)
-            return
-    await bot.send_message(chat_id, text, reply_markup=kb)
+    await bot.send_message(chat_id, TARIFF_CARD_TEXT, reply_markup=tariffs_keyboard())
 
 async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float | None]:
-    """Шлёт сообщение шага воронки. Возвращает (следующий шаг, задержка в сек).
-
-    Схема сверена вручную с Miro-доской 2026-07-14 (не по памяти/скриншотам,
-    а через accessibility-дерево доски — так надёжнее). Первые три дожима идут
-    на чистых относительных задержках от заявки (30 мин / 1 час / 2 часа),
-    дальше — гибридная схема с абсолютными день-N-в-HH:MM МСК таймкодами
-    (см. seconds_until_msk)."""
+    """Шлёт сообщение шага воронки. Возвращает (следующий шаг, задержка в сек)."""
     if step == 1:
         await bot.send_message(
             chat_id, STEP1_VIDEO_TEXT,
-            reply_markup=intro_cta_keyboard("Перейти к оплате бота"),
+            reply_markup=pay_cta_keyboard("Перейти к оплате"),
         )
-        return 2, 15  # тариф-карта — ЧЕРЕЗ 15 СЕКУНД
+        return 2, 10
     if step == 2:
         await send_tariff_card(chat_id)
-        return 3, dbg_delay(30 * 60)  # дожим 1 — через 30 минут после заявки
+        return 3, 30 * 60
     if step == 3:
-        dozhim1_photo = os.path.join(PHOTOS_DIR, "dozhim1.jpg")
-        kb = pay_cta_keyboard("Получить доступ")
-        if os.path.exists(dozhim1_photo):
-            await bot.send_photo(chat_id, FSInputFile(dozhim1_photo), caption=DOZHIM_1_TEXT, reply_markup=kb)
-        else:
-            await bot.send_message(chat_id, DOZHIM_1_TEXT, reply_markup=kb)
-        return 4, dbg_delay(30 * 60)  # дожим 2 — через 1 час после заявки (ещё +30 мин)
+        await bot.send_message(
+            chat_id, DOZHIM_1_TEXT,
+            reply_markup=pay_cta_keyboard("Получить доступ"),
+        )
+        return 4, 30 * 60
     if step == 4:
-        # В Miro у дожима 2 нет фото — только текст (плейсхолдер "видео на
-        # 10-15 сек" не реализован отдельным шагом). Раньше сюда по ошибке
-        # прикреплялась медиагруппа из фото6+фото8 — убрано.
-        kb = pay_cta_keyboard("Получить доступ к боту")
-        await bot.send_message(chat_id, DOZHIM_2_TEXT, reply_markup=kb)
-        return 5, dbg_delay(60 * 60)  # дожим 3 — через 2 часа после заявки (ещё +1 час)
+        await bot.send_message(
+            chat_id, DOZHIM_2_TEXT,
+            reply_markup=pay_cta_keyboard("Получить доступ к боту"),
+        )
+        return 5, 60 * 60
     if step == 5:
-        dozhim3_photo = os.path.join(PHOTOS_DIR, "dozhim3.jpg")
-        kb = pay_cta_keyboard("Попробовать бота")
-        if os.path.exists(dozhim3_photo):
-            await bot.send_photo(chat_id, FSInputFile(dozhim3_photo), caption=DOZHIM_3_TEXT, reply_markup=kb)
-        else:
-            await bot.send_message(chat_id, DOZHIM_3_TEXT, reply_markup=kb)
-        return 6, dbg_delay(seconds_until_msk(1, 12))  # день 2 в 12 МСК
-    if step == 6:
-        demo_photo = os.path.join(PHOTOS_DIR, "dozhim2_demo.png")
-        kb = pay_cta_keyboard("Получить доступ")
-        if os.path.exists(demo_photo):
-            await bot.send_photo(chat_id, FSInputFile(demo_photo), caption=DOZHIM_5_TEXT, reply_markup=kb)
-        else:
-            await bot.send_message(chat_id, DOZHIM_5_TEXT, reply_markup=kb)
-        return 7, dbg_delay(seconds_until_msk(0, 19))  # день 2 в 19 МСК (тот же день)
-    if step == 7:
-        price_photo = os.path.join(PHOTOS_DIR, "dozhim4_price.png")
-        kb = pay_cta_keyboard("Попробовать бота")
-        if os.path.exists(price_photo):
-            await bot.send_photo(chat_id, FSInputFile(price_photo), caption=DOZHIM_4_TEXT, reply_markup=kb)
-        else:
-            await bot.send_message(chat_id, DOZHIM_4_TEXT, reply_markup=kb)
-        return 8, dbg_delay(seconds_until_msk(1, 17))  # день 3 в 17 МСК
-    if step == 8:
-        testimonial_photo = os.path.join(PHOTOS_DIR, "dozhim2_testimonial.png")
-        kb = pay_cta_keyboard("Оплатить бота")
-        if os.path.exists(testimonial_photo):
-            await bot.send_photo(chat_id, FSInputFile(testimonial_photo), caption=DOZHIM_6_TEXT, reply_markup=kb)
-        else:
-            await bot.send_message(chat_id, DOZHIM_6_TEXT, reply_markup=kb)
-        return 9, dbg_delay(seconds_until_msk(1, 15))  # день 4 в 15 МСК
-    if step == 9:
-        last_photo = os.path.join(PHOTOS_DIR, "dozhim7_last.png")
-        kb = pay_cta_keyboard("Оплатить бота")
-        if os.path.exists(last_photo):
-            await bot.send_photo(chat_id, FSInputFile(last_photo), caption=DOZHIM_7_TEXT, reply_markup=kb)
-        else:
-            await bot.send_message(chat_id, DOZHIM_7_TEXT, reply_markup=kb)
-        return 10, None  # последний дожим — дальше не шлём
+        await bot.send_message(
+            chat_id, DOZHIM_3_TEXT,
+            reply_markup=pay_cta_keyboard("Попробовать бота"),
+        )
+        return 6, None  # последний дожим — дальше не шлём
     return None, None
 
-async def mark_paid(user_id: str, tier: str, paid_until_override: str | None = None):
+async def mark_paid(
+    user_id: str,
+    tier: str,
+    *,
+    amount: float | None = None,
+    commission_sum: float | None = None,
+    order_id: str | None = None,
+):
     """Ветка "после оплаты": вызывается вебхуком Продамуса (и /testpay для теста).
     Открытие доступа в БД — критическая часть и должна прокидывать исключение
     наверх (чтобы вебхук вернул ошибку и Продамус повторил попытку).
-    Отправка уведомления пользователю — best-effort: если юзер заблокировал
-    бота, это не должно выглядеть как "оплата не прошла".
-    paid_until_override — короткий срок доступа для теста (чтобы за пару минут
-    увидеть полный цикл: доступ → напоминания → истечение → win-back)."""
+    Отправка уведомления пользователю и запись в Google Sheets — best-effort:
+    если юзер заблокировал бота или Sheets недоступен, это не должно выглядеть
+    как "оплата не прошла"."""
     days = TIERS[tier]["days"]
-    paid_until = paid_until_override or (now_utc() + timedelta(days=days)).isoformat()
-    renewal_schedule = next_renewal_schedule(paid_until, 1)
+    paid_until = (now_utc() + timedelta(days=days)).isoformat()
     await storage.upsert_subscription(
         user_id,
         status="active",
@@ -714,16 +440,29 @@ async def mark_paid(user_id: str, tier: str, paid_until_override: str | None = N
         paid_until=paid_until,
         funnel_next_at=None,
         renewal_reminder_sent=0,
-        renewal_stage=0,
-        renewal_next_at=renewal_schedule[1] if renewal_schedule else None,
     )
     log.info("Оплата: user_id=%s tier=%s до %s", user_id, tier, paid_until)
+
+    final_amount = amount if amount is not None else TIERS[tier]["price"]
+    final_commission = commission_sum or 0
+
+    # Собственная история платежей в SQLite — источник метрик "продлил/не продлил",
+    # не зависит от того, подключены ли Google Sheets.
+    await storage.add_payment(
+        user_id=user_id, tier=tier, amount=final_amount,
+        commission_sum=final_commission, order_id=order_id or "", status="success",
+    )
+    # Журнал в Google Sheets (если подключен).
+    await _sheets_log_payment(
+        user_id=user_id, tier=tier, amount=final_amount,
+        commission_sum=final_commission, status="success", order_id=order_id or "",
+    )
+
     try:
-        paid_photo = os.path.join(PHOTOS_DIR, "paid.png")
-        if os.path.exists(paid_photo):
-            await bot.send_photo(int(user_id), FSInputFile(paid_photo), caption=PAID_TEXT, reply_markup=main_keyboard())
-        else:
-            await bot.send_message(int(user_id), PAID_TEXT, reply_markup=main_keyboard())
+        await bot.send_message(int(user_id), PAID_TEXT, reply_markup=main_keyboard())
+    except TelegramForbiddenError:
+        log.info("Оплата прошла, но юзер заблокировал бота: user_id=%s", user_id)
+        await storage.set_blocked(user_id, True)
     except Exception:
         log.exception("Оплата прошла, но не удалось отправить уведомление user_id=%s", user_id)
 
@@ -748,8 +487,6 @@ async def handle_prodamus_webhook(request: web.Request) -> web.Response:
     sign_header = request.headers.get("Sign", "")
     sig_valid = prodamus_client.verify(body, sign_header)
     _diag["last_webhook_sig_valid"] = sig_valid
-    _diag["last_webhook_sign_header"] = sign_header
-    _diag["last_webhook_expected_sig"] = prodamus_client.sign(body)
     if not sig_valid:
         log.warning("Продамус: неверная подпись вебхука, тело=%s", raw_body[:500])
         _diag["last_webhook_result"] = "bad signature"
@@ -769,8 +506,13 @@ async def handle_prodamus_webhook(request: web.Request) -> web.Response:
     log.info("Продамус webhook: order_num=%s status=%s", order_num, payment_status)
 
     if payment_status == "success" and tier in TIERS:
+        amount = _to_float(body.get("sum"))
+        commission_sum = _to_float(body.get("commission_sum"))
         try:
-            await mark_paid(user_id, tier)
+            await mark_paid(
+                user_id, tier,
+                amount=amount, commission_sum=commission_sum, order_id=order_num,
+            )
             _diag["last_webhook_result"] = "mark_paid ok"
         except Exception as e:
             log.exception("Продамус: ошибка активации user_id=%s tier=%s", user_id, tier)
@@ -783,13 +525,7 @@ async def handle_prodamus_webhook(request: web.Request) -> web.Response:
     return web.Response(status=200, text="success")
 
 async def handle_debug(request: web.Request) -> web.Response:
-    # Защита: без правильного ключа отдаём 404 (не 403 — чтобы не палить сам факт
-    # существования эндпоинта). Ключ = последние 8 символов PRODAMUS_SECRET_KEY,
-    # так что не нужно заводить отдельную переменную окружения на Railway.
     import json as _json
-    expected_key = (PRODAMUS_SECRET_KEY or "")[-8:]
-    if not expected_key or request.query.get("key") != expected_key:
-        return web.Response(status=404, text="not found")
     return web.Response(
         status=200,
         content_type="application/json",
@@ -832,15 +568,16 @@ async def funnel_tick():
         uid = sub["user_id"]
         try:
             next_step, delay = await send_funnel_step(int(uid), sub["funnel_step"])
-        except Exception as e:
-            # юзер заблокировал бота и т.п. — останавливаем воронку, чтобы не долбить
-            log.exception("Не отправился шаг воронки user_id=%s step=%s", uid, sub["funnel_step"])
-            _diag["last_funnel_error"] = f"{type(e).__name__}: {e}"
-            _diag["last_funnel_error_step"] = sub["funnel_step"]
-            _diag["last_funnel_error_at"] = datetime.now(timezone.utc).isoformat()
+        except TelegramForbiddenError:
+            log.info("Воронка: user_id=%s заблокировал бота — останавливаем", uid)
+            await storage.set_blocked(uid, True)
             await storage.set_funnel_step(uid, sub["funnel_step"], None)
             continue
-        _diag["last_funnel_step_sent"] = sub["funnel_step"]
+        except Exception:
+            # прочая ошибка отправки — останавливаем воронку, чтобы не долбить
+            log.exception("Не отправился шаг воронки user_id=%s step=%s", uid, sub["funnel_step"])
+            await storage.set_funnel_step(uid, sub["funnel_step"], None)
+            continue
         if next_step is None:
             await storage.set_funnel_step(uid, sub["funnel_step"], None)
         else:
@@ -851,21 +588,22 @@ async def funnel_tick():
         await storage.upsert_subscription(sub["user_id"], status="expired")
         log.info("Подписка истекла: user_id=%s", sub["user_id"])
 
-    # 3. Многоступенчатая воронка продления: за 3 дня / за 1 день / в день
-    # списания / за 1 час / win-back (см. RENEWAL_STAGE_TEXTS).
-    for sub in await storage.due_renewal_users(now_iso):
+    # 3. Дожим на продление: paid_until истекает в ближайшие 2 дня
+    deadline_iso = iso_in(RENEWAL_REMIND_BEFORE)
+    for sub in await storage.expiring_subscriptions(now_iso, deadline_iso):
         uid = sub["user_id"]
-        stage = (sub["renewal_stage"] or 0) + 1
         try:
-            await send_renewal_stage(int(uid), stage)
+            await bot.send_message(
+                int(uid), RENEWAL_TEXT,
+                reply_markup=pay_cta_keyboard("Продлить подписку"),
+            )
+        except TelegramForbiddenError:
+            log.info("Напоминание о продлении: user_id=%s заблокировал бота", uid)
+            await storage.set_blocked(uid, True)
         except Exception:
-            log.exception("Не отправился шаг продления user_id=%s stage=%s", uid, stage)
-        nxt = next_renewal_schedule(sub["paid_until"], stage + 1) if sub["paid_until"] else None
-        await storage.upsert_subscription(
-            uid,
-            renewal_stage=stage,
-            renewal_next_at=nxt[1] if nxt else None,
-        )
+            log.exception("Не отправилось напоминание о продлении user_id=%s", uid)
+        # флаг ставим в любом случае, чтобы не ретраить каждый тик
+        await storage.upsert_subscription(uid, renewal_reminder_sent=1)
 
 async def funnel_worker():
     while True:
@@ -875,22 +613,36 @@ async def funnel_worker():
             log.exception("Ошибка фоновой задачи воронки")
         await asyncio.sleep(FUNNEL_CHECK_INTERVAL)
 
+async def sheets_sync_worker():
+    """Каждые 5 минут обновляет лист «Дашборд» (если Google Sheets подключен).
+    Если не подключен — просто ждёт, ничего не делая (дёшево)."""
+    while True:
+        await _sheets_write_dashboard()
+        await asyncio.sleep(SHEETS_SYNC_INTERVAL)
+
 # ─── Команды ─────────────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     uid = str(message.from_user.id)
     if storage:
+        await storage.set_blocked(uid, False)  # написал нам — точно не заблокирован
         name = message.from_user.first_name
         client = await storage.get_client(uid)
         if not client.get("name"):
             await storage.upsert_client(uid, name, client.get("profile", {}))
 
     if not storage:
-        await send_welcome(message.chat.id)
+        await message.answer(WELCOME_FUNNEL_TEXT, reply_markup=main_keyboard())
         return
 
-    if await has_access(uid):
+    sub = await storage.get_subscription(uid)
+    if sub is None:
+        # Новый юзер — запускаем воронку: шаг 1 через 5 секунд
+        await storage.upsert_subscription(uid, status="trial", funnel_step=0)
+        await message.answer(WELCOME_FUNNEL_TEXT, reply_markup=main_keyboard())
+        await storage.set_funnel_step(uid, 1, iso_in(5))
+    elif await has_access(uid):
         await message.answer(
             "👋 Привет! Это сборник полезных рецептов Марии Дивисенко.\n\n"
             "🍽 <b>Рецепты</b> — просматривать 250+ рецептов по категориям\n"
@@ -899,13 +651,9 @@ async def cmd_start(message: Message):
             reply_markup=main_keyboard(),
         )
     else:
-        # Новый юзер ИЛИ есть запись, но не оплачено — (пере)запускаем воронку
-        # с самого начала: приветствие → (через 5 сек) видео-шаг → (через
-        # 15 сек) карточка "Что ты получишь". НЕ показываем тарифы сразу —
-        # они идут только по кнопке / в свой черёд по воронке.
-        await storage.upsert_subscription(uid, status="trial", funnel_step=0)
-        await send_welcome(message.chat.id)
-        await storage.set_funnel_step(uid, 1, iso_in(5))
+        # Запись есть, но не оплачено — приветствуем и сразу показываем тарифы
+        await message.answer(WELCOME_FUNNEL_TEXT, reply_markup=main_keyboard())
+        await send_tariff_card(message.chat.id)
 
 @dp.message(Command("profile"))
 async def cmd_profile(message: Message):
@@ -952,16 +700,6 @@ async def cb_show_tariffs(callback: CallbackQuery):
     await send_tariff_card(callback.message.chat.id)
     await callback.answer()
 
-@dp.callback_query(F.data == "show_new_tariffs")
-async def cb_show_new_tariffs(callback: CallbackQuery):
-    await send_new_tariff_card(callback.message.chat.id, callback.from_user.first_name)
-    await callback.answer()
-
-@dp.callback_query(F.data == "show_renewal_tariffs")
-async def cb_show_renewal_tariffs(callback: CallbackQuery):
-    await send_renewal_tariff_card(callback.message.chat.id, callback.from_user.first_name)
-    await callback.answer()
-
 @dp.callback_query(F.data.startswith("tier:"))
 async def cb_choose_tier(callback: CallbackQuery):
     tier = callback.data.split(":")[1]
@@ -969,105 +707,105 @@ async def cb_choose_tier(callback: CallbackQuery):
         await callback.answer("Неизвестный тариф")
         return
     uid = str(callback.from_user.id)
-    name = callback.from_user.first_name or "Привет"
     link = await generate_payment_link(uid, tier)
-    # Персонализированный формат по просьбе Назира: ссылка не идёт "голой".
-    caption = (
-        f"{name}, вот твоя ссылка на оплату 👇\n\n"
-        "Сразу после оплаты в боте появится функционал с рецептами и твоим "
-        "личным AI-ассистентом МарИИей"
-    )
+    title = TIERS[tier]["title"]
     if link.startswith("http"):
+        # Когда подключим Продамус — ссылка станет настоящей и уйдёт кнопкой
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Оплатить", url=link)]
         ])
-        await callback.message.answer(caption, reply_markup=kb)
+        await callback.message.answer(f"Оплата: <b>{title}</b> 👇", reply_markup=kb)
     else:
-        await callback.message.answer(f"{caption}\n\n{link}")
+        await callback.message.answer(f"💳 <b>{title}</b>\n\n{link}")
     await callback.answer()
 
 @dp.message(Command("testpay"))
 async def cmd_testpay(message: Message):
-    """Тестовая заглушка оплаты: /testpay 1m|3m|6m. Доступна админу, а также
-    ВСЕМ, когда включён тест пост-оплатной серии (RENEWAL_TEST_INTERVAL_SEC>0)
-    — чтобы Назир мог сам выдать себе доступ и посмотреть рецепты/МарИИю и
-    серию сообщений после оплаты. Будет удалена после подключения вебхука."""
+    """Тестовая заглушка оплаты: /testpay 1m|3m|6m. Только для админа.
+    Будет удалена после подключения вебхука Продамуса."""
     if not storage:
         return
-    is_admin = ADMIN_USER_ID and str(message.from_user.id) == ADMIN_USER_ID
-    if not is_admin and not TESTPAY_OPEN and RENEWAL_TEST_INTERVAL <= 0:
+    if not ADMIN_USER_ID or str(message.from_user.id) != ADMIN_USER_ID:
         return
     parts = message.text.split()
     tier = parts[1] if len(parts) > 1 else "1m"
     if tier not in TIERS:
         await message.answer("Тариф: 1m, 3m или 6m")
         return
-    # В тесте пост-оплатной серии выдаём КОРОТКИЙ доступ, чтобы он реально
-    # истёк по ходу теста (примерно на этапе "день списания") — так видно,
-    # что логика окончания подписки работает: доступ закрывается, меню
-    # рецептов/МарИИи перестаёт пускать. Иначе (30 дней) доступ бы остался.
-    override = None
-    if not is_admin and RENEWAL_TEST_INTERVAL > 0:
-        override = (now_utc() + timedelta(seconds=RENEWAL_TEST_INTERVAL * 3 + 30)).isoformat()
-    await mark_paid(str(message.from_user.id), tier, paid_until_override=override)
+    await mark_paid(
+        str(message.from_user.id), tier,
+        order_id=f"TEST_{secrets.token_hex(3)}",
+    )
 
-# ─── Меню рецептов ────────────────────────────────────────────────────────────
+# ─── Рассылки (админ) ─────────────────────────────────────────────────────────
 
-@dp.callback_query(F.data.startswith("fav:"))
-async def toggle_favorite(callback: CallbackQuery):
-    if not storage:
-        await callback.answer()
-        return
-    if not await has_access(str(callback.from_user.id)):
-        await callback.answer()
-        await send_tariff_card(callback.message.chat.id)
-        return
-    _, action, recipe_id = callback.data.split(":", 2)
-    uid = str(callback.from_user.id)
-    if action == "add":
-        await storage.add_favorite(uid, recipe_id)
-        is_fav = True
-        note = "Добавлено в избранное ⭐"
-    else:
-        await storage.remove_favorite(uid, recipe_id)
-        is_fav = False
-        note = "Убрано из избранного"
-    recipe = RECIPES.get(recipe_id)
-    if recipe:
-        cat_idx, sub_idx = find_cat_sub_for_recipe(recipe)
+async def _run_broadcast(user_ids: list[str], text: str, admin_chat_id: int):
+    """Шлёт текст по списку user_id с паузой между сообщениями (см. BROADCAST_DELAY),
+    чтобы не словить ограничение Telegram на массовую рассылку. Работает в фоне —
+    не блокирует бота на время долгой рассылки (при 1-2к получателей это минуты)."""
+    sent = failed = blocked_count = 0
+    for uid in user_ids:
         try:
-            await callback.message.edit_reply_markup(
-                reply_markup=recipe_keyboard(cat_idx, sub_idx, recipe_id, is_fav)
-            )
+            await bot.send_message(int(uid), text)
+            sent += 1
+        except TelegramForbiddenError:
+            blocked_count += 1
+            await storage.set_blocked(uid, True)
+        except TelegramRetryAfter as e:
+            log.warning("Рассылка: flood control, ждём %s сек", e.retry_after)
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                await bot.send_message(int(uid), text)
+                sent += 1
+            except Exception:
+                failed += 1
+                log.exception("Рассылка: не удалось отправить (после retry) user_id=%s", uid)
         except Exception:
-            pass
-    await callback.answer(note)
+            failed += 1
+            log.exception("Рассылка: не удалось отправить user_id=%s", uid)
+        await asyncio.sleep(BROADCAST_DELAY)
 
-@dp.message(F.text == "⭐ Избранное")
-async def show_favorites(message: Message):
+    try:
+        await bot.send_message(
+            admin_chat_id,
+            f"📨 Рассылка завершена.\n"
+            f"Отправлено: {sent}\n"
+            f"Заблокировали бота: {blocked_count}\n"
+            f"Ошибок: {failed}",
+        )
+    except Exception:
+        log.exception("Не удалось отправить итог рассылки админу")
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    """Рассылка по сегменту: /broadcast сегмент текст сообщения.
+    Сегменты: all (все), paid (активная подписка), unpaid (не платили),
+    expired (истёкшая подписка). Только для админа. Заблокировавших бота
+    юзеров пропускает автоматически. Отправка идёт в фоне с паузами."""
     if not storage:
         return
-    if not await has_access(str(message.from_user.id)):
-        await send_tariff_card(message.chat.id)
+    if not ADMIN_USER_ID or str(message.from_user.id) != ADMIN_USER_ID:
         return
-    fav_ids = [r for r in await storage.get_favorites(str(message.from_user.id)) if r in RECIPES]
-    if not fav_ids:
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3 or parts[1] not in BROADCAST_SEGMENTS:
         await message.answer(
-            "⭐ <b>Избранное пустое</b>\n\n"
-            "Открой любой рецепт и нажми «⭐ В избранное» — он появится здесь, "
-            "чтобы был всегда под рукой."
+            "Использование: /broadcast сегмент текст\n\n"
+            "Сегменты:\n"
+            "all — все зарегистрированные\n"
+            "paid — активная подписка\n"
+            "unpaid — ни разу не платили\n"
+            "expired — подписка истекла"
         )
         return
-    buttons = []
-    for rid in fav_ids:
-        name = RECIPES[rid]["name"]
-        if len(name) > 40:
-            name = name[:37] + "..."
-        buttons.append([InlineKeyboardButton(text=name, callback_data=f"rec:{rid}")])
-    await message.answer(
-        "⭐ <b>Твоё избранное:</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-    )
+    segment, text = parts[1], parts[2]
+    user_ids = await storage.users_in_segment(BROADCAST_SEGMENTS[segment])
+    if not user_ids:
+        await message.answer("В этом сегменте сейчас никого нет.")
+        return
+    await message.answer(f"🚀 Рассылка запущена: {len(user_ids)} получателей ({segment}).")
+    asyncio.create_task(_run_broadcast(user_ids, text, message.chat.id))
+
+# ─── Меню рецептов ────────────────────────────────────────────────────────────
 
 @dp.message(F.text == "🍽 Рецепты")
 async def show_categories(message: Message):
@@ -1119,7 +857,6 @@ async def show_recipe(callback: CallbackQuery):
         return
     cat_idx, sub_idx = find_cat_sub_for_recipe(recipe)
     text = format_recipe(recipe)
-    is_fav = await storage.is_favorite(str(callback.from_user.id), recipe_id) if storage else False
     try:
         await callback.message.delete()
     except Exception:
@@ -1140,12 +877,14 @@ async def show_recipe(callback: CallbackQuery):
                 await callback.message.answer_photo(
                     FSInputFile(photo_path),
                     caption=text,
-                    reply_markup=recipe_keyboard(cat_idx, sub_idx, recipe_id, is_fav),
+                    reply_markup=recipe_keyboard(cat_idx, sub_idx),
+                    protect_content=True,
                 )
                 photo_sent_with_caption = True
             else:
                 await callback.message.answer_photo(
                     FSInputFile(photo_path),
+                    protect_content=True,
                 )
         except Exception:
             # не глотаем молча: фото не ушло — логируем и шлём хотя бы текст
@@ -1154,7 +893,8 @@ async def show_recipe(callback: CallbackQuery):
     if not photo_sent_with_caption:
         await callback.message.answer(
             text,
-            reply_markup=recipe_keyboard(cat_idx, sub_idx, recipe_id, is_fav),
+            reply_markup=recipe_keyboard(cat_idx, sub_idx),
+            protect_content=True,
         )
     await callback.answer()
 
@@ -1178,19 +918,12 @@ async def handle_back(callback: CallbackQuery):
         cat_idx, sub_idx = int(parts[2]), int(parts[3])
         cat = CATEGORIES[cat_idx]
         sub = STRUCTURE[cat][sub_idx]
-        # Рецепт мог быть показан как фото — его нельзя "отредактировать" в
-        # текстовый список, поэтому удаляем старое сообщение и шлём свежий
-        # список (иначе рецепт-фото зависает сверху — жалоба Назира 2026-07-16).
         try:
             await callback.message.edit_text(
                 f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
                 reply_markup=recipes_keyboard(cat_idx, sub_idx),
             )
         except Exception:
-            try:
-                await callback.message.delete()
-            except Exception:
-                pass
             await callback.message.answer(
                 f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
                 reply_markup=recipes_keyboard(cat_idx, sub_idx),
@@ -1221,6 +954,7 @@ async def handle_text(message: Message):
         return
 
     uid = str(message.from_user.id)
+    await storage.set_blocked(uid, False)  # написал нам — точно не заблокирован
 
     if not await has_access(uid):
         await send_tariff_card(message.chat.id)
@@ -1249,7 +983,7 @@ async def handle_text(message: Message):
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 async def main():
-    global storage, mariya
+    global storage, mariya, sheets_client
     storage = Storage(DB_PATH)
     await storage.init()
     mariya = Mariya(
@@ -1257,11 +991,23 @@ async def main():
         recipes_data=data,
         model=MODEL,
     )
+
+    if GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_SHEET_ID:
+        try:
+            sheets_client = SheetsClient(GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_SHEET_ID)
+            log.info("Google Sheets интеграция включена (sheet_id=%s)", GOOGLE_SHEET_ID)
+        except Exception:
+            log.exception("Не удалось инициализировать Google Sheets — бот работает без него")
+            sheets_client = None
+    else:
+        log.info("Google Sheets интеграция выключена (нет GOOGLE_SERVICE_ACCOUNT_JSON/GOOGLE_SHEET_ID)")
+
     log.info("Бот запущен")
     await asyncio.gather(
         run_polling_safe(),
         funnel_worker(),
         prodamus_webhook_server(),
+        sheets_sync_worker(),
     )
 
 if __name__ == "__main__":
