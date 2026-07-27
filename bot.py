@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 DB_PATH = os.environ.get("DB_PATH", "mariya_data.db")
 MENU_PATH = os.environ.get("MENU_PATH", "menu.json")
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+LEARN_MODEL = os.environ.get("LEARN_MODEL", "claude-haiku-4-5-20251001")
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID")  # для тестовой команды /testpay
 PRODAMUS_SECRET_KEY = os.environ.get("PRODAMUS_SECRET_KEY")
 PRODAMUS_SHOP_URL = os.environ.get("PRODAMUS_SHOP_URL", "https://pprecepty.payform.ru/")
@@ -196,12 +198,15 @@ TIERS = {
     "6m": {"title": "6 месяцев — 6990₽ (выгоднее на 30%)", "label": "6 месяцев", "days": 180, "price": 6990},
 }
 
-# Сегменты для /broadcast: ключ команды -> статус подписки (None = все).
+# Сегменты для /broadcast: ключ команды -> бизнес-сегмент в Storage.
 BROADCAST_SEGMENTS = {
-    "all": None,
+    "all": "all",
     "paid": "active",
     "unpaid": "trial",
     "expired": "expired",
+    "firstpaid": "firstpaid",
+    "renewed": "renewed",
+    "notrenewed": "notrenewed",
 }
 BROADCAST_DELAY = 0.05  # ~20 сообщений/сек — с запасом от лимита Telegram (~30/сек)
 
@@ -558,8 +563,11 @@ async def _sheets_write_dashboard():
         return
     try:
         metrics = await storage.dashboard_metrics()
+        snapshot = await storage.report_snapshot()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, sheets_client.write_dashboard_snapshot, metrics)
+        await loop.run_in_executor(
+            None, sheets_client.write_dashboard_snapshot, metrics, snapshot
+        )
     except Exception:
         log.exception("Не удалось обновить дашборд Google Sheets")
 
@@ -573,19 +581,15 @@ def _to_float(value) -> float | None:
     except (TypeError, ValueError):
         return None
 
-# ─── Диагностика поллинга и вебхука (временно, чтобы обойти проблему с логами Railway) ──
+# ─── Внутренняя диагностика для логов (не публикуется через HTTP) ─────────────
 _diag = {
     "polling_attempts": 0,
     "last_error": None,
     "last_error_at": None,
     "last_started_at": None,
-    "bot_token_prefix": BOT_TOKEN.split(":")[0] if BOT_TOKEN else None,
     "prodamus_demo_mode": None,  # выставится после чтения PRODAMUS_DEMO_MODE ниже
     "last_webhook_at": None,
-    "last_webhook_raw": None,
     "last_webhook_sig_valid": None,
-    "last_webhook_sign_header": None,
-    "last_webhook_expected_sig": None,
     "last_webhook_order_num": None,
     "last_webhook_status": None,
     "last_webhook_result": None,
@@ -646,7 +650,7 @@ async def send_new_tariff_card(chat_id: int, name: str | None):
     new_tariff_card.png — 'Выбери тариф для подписки') — шлют сюда шаг 2
     (по кнопке 'Оплатить доступ') и все дожимы 3-9. Отдельная от карточки
     продления, у неё своё фото и текст."""
-    text = NEW_TARIFF_TEXT_TMPL.format(name=name or "Привет")
+    text = NEW_TARIFF_TEXT_TMPL.format(name=html.escape(name or "Привет"))
     new_tariff_photo = os.path.join(PHOTOS_DIR, "new_tariff_card.png")
     if os.path.exists(new_tariff_photo):
         await bot.send_photo(chat_id, FSInputFile(new_tariff_photo), caption=text, reply_markup=tariffs_keyboard())
@@ -654,7 +658,7 @@ async def send_new_tariff_card(chat_id: int, name: str | None):
         await bot.send_message(chat_id, text, reply_markup=tariffs_keyboard())
 
 async def send_renewal_tariff_card(chat_id: int, name: str | None):
-    text = RENEWAL_TARIFF_TEXT_TMPL.format(name=name or "Привет")
+    text = RENEWAL_TARIFF_TEXT_TMPL.format(name=html.escape(name or "Привет"))
     photo_path = os.path.join(PHOTOS_DIR, "renewal_tariff_card.png")
     if os.path.exists(photo_path):
         await bot.send_photo(chat_id, FSInputFile(photo_path), caption=text, reply_markup=tariffs_keyboard())
@@ -754,7 +758,7 @@ async def mark_paid(
     amount: float | None = None,
     commission_sum: float | None = None,
     order_id: str | None = None,
-):
+ ) -> bool:
     """Ветка "после оплаты": вызывается вебхуком Продамуса (и /testpay для теста).
     Открытие доступа в БД — критическая часть и должна прокидывать исключение
     наверх (чтобы вебхук вернул ошибку и Продамус повторил попытку).
@@ -763,30 +767,49 @@ async def mark_paid(
     как "оплата не прошла".
     paid_until_override — короткий срок доступа для теста (чтобы за пару минут
     увидеть полный цикл: доступ → напоминания → истечение → win-back)."""
-    days = TIERS[tier]["days"]
-    paid_until = paid_until_override or (now_utc() + timedelta(days=days)).isoformat()
-    renewal_schedule = next_renewal_schedule(paid_until, 1)
-    await storage.upsert_subscription(
-        user_id,
-        status="active",
-        tier=tier,
-        paid_until=paid_until,
-        funnel_next_at=None,
-        renewal_reminder_sent=0,
-        renewal_stage=0,
-        renewal_next_at=renewal_schedule[1] if renewal_schedule else None,
-    )
-    log.info("Оплата: user_id=%s tier=%s до %s", user_id, tier, paid_until)
+    if order_id and await storage.payment_exists(order_id):
+        log.info("Повторный вебхук оплаты проигнорирован: order_id=%s", order_id)
+        return False
 
+    days = TIERS[tier]["days"]
+    if paid_until_override:
+        paid_until = paid_until_override
+    else:
+        # При досрочном продлении оставшиеся оплаченные дни не сгорают.
+        base = now_utc()
+        current = await storage.get_subscription(user_id)
+        current_until = (current or {}).get("paid_until")
+        if current_until:
+            try:
+                current_dt = datetime.fromisoformat(current_until)
+                if current_dt.tzinfo is None:
+                    current_dt = current_dt.replace(tzinfo=timezone.utc)
+                if current_dt > base:
+                    base = current_dt
+            except ValueError:
+                log.warning(
+                    "Некорректный paid_until у user_id=%s: %s",
+                    user_id, current_until,
+                )
+        paid_until = (base + timedelta(days=days)).isoformat()
+
+    renewal_schedule = next_renewal_schedule(paid_until, 1)
     final_amount = amount if amount is not None else TIERS[tier]["price"]
     final_commission = commission_sum or 0
-
-    # Собственная история платежей в SQLite — источник метрик "продлил/не продлил",
-    # не зависит от того, подключены ли Google Sheets.
-    await storage.add_payment(
-        user_id=user_id, tier=tier, amount=final_amount,
-        commission_sum=final_commission, order_id=order_id or "", status="success",
+    processed = await storage.activate_payment(
+        user_id=user_id,
+        tier=tier,
+        paid_until=paid_until,
+        renewal_next_at=renewal_schedule[1] if renewal_schedule else None,
+        amount=final_amount,
+        commission_sum=final_commission,
+        order_id=order_id,
     )
+    if not processed:
+        log.info("Повторный платёж не записан: order_id=%s", order_id)
+        return False
+
+    log.info("Оплата: user_id=%s tier=%s до %s", user_id, tier, paid_until)
     # Журнал в Google Sheets (если подключен).
     await _sheets_log_payment(
         user_id=user_id, tier=tier, amount=final_amount,
@@ -804,13 +827,13 @@ async def mark_paid(
         await storage.set_blocked(user_id, True)
     except Exception:
         log.exception("Оплата прошла, но не удалось отправить уведомление user_id=%s", user_id)
+    return True
 
 # ─── Вебхук Продамуса ─────────────────────────────────────────────────────────
 
 async def handle_prodamus_webhook(request: web.Request) -> web.Response:
     raw_body = await request.text()
     _diag["last_webhook_at"] = datetime.now(timezone.utc).isoformat()
-    _diag["last_webhook_raw"] = raw_body[:1000]
     if not prodamus_client:
         log.error("Продамус: пришёл вебхук, но PRODAMUS_SECRET_KEY не настроен")
         _diag["last_webhook_result"] = "not configured"
@@ -826,8 +849,6 @@ async def handle_prodamus_webhook(request: web.Request) -> web.Response:
     sign_header = request.headers.get("Sign", "")
     sig_valid = prodamus_client.verify(body, sign_header)
     _diag["last_webhook_sig_valid"] = sig_valid
-    _diag["last_webhook_sign_header"] = sign_header
-    _diag["last_webhook_expected_sig"] = prodamus_client.sign(body)
     if not sig_valid:
         log.warning("Продамус: неверная подпись вебхука, тело=%s", raw_body[:500])
         _diag["last_webhook_result"] = "bad signature"
@@ -850,11 +871,13 @@ async def handle_prodamus_webhook(request: web.Request) -> web.Response:
         amount = _to_float(body.get("sum"))
         commission_sum = _to_float(body.get("commission_sum"))
         try:
-            await mark_paid(
+            processed = await mark_paid(
                 user_id, tier,
                 amount=amount, commission_sum=commission_sum, order_id=order_num,
             )
-            _diag["last_webhook_result"] = "mark_paid ok"
+            _diag["last_webhook_result"] = (
+                "mark_paid ok" if processed else "duplicate ignored"
+            )
         except Exception as e:
             log.exception("Продамус: ошибка активации user_id=%s tier=%s", user_id, tier)
             _diag["last_webhook_result"] = f"mark_paid error: {e}"
@@ -865,23 +888,8 @@ async def handle_prodamus_webhook(request: web.Request) -> web.Response:
 
     return web.Response(status=200, text="success")
 
-async def handle_debug(request: web.Request) -> web.Response:
-    # Защита: без правильного ключа отдаём 404 (не 403 — чтобы не палить сам факт
-    # существования эндпоинта). Ключ = последние 8 символов PRODAMUS_SECRET_KEY,
-    # так что не нужно заводить отдельную переменную окружения на Railway.
-    import json as _json
-    expected_key = (PRODAMUS_SECRET_KEY or "")[-8:]
-    if not expected_key or request.query.get("key") != expected_key:
-        return web.Response(status=404, text="not found")
-    return web.Response(
-        status=200,
-        content_type="application/json",
-        text=_json.dumps(_diag, ensure_ascii=False, default=str),
-    )
-
 async def run_polling_safe():
-    """Обёртка над dp.start_polling: ловит и запоминает любую ошибку,
-    чтобы её можно было увидеть через /debug (логи Railway сейчас не видны)."""
+    """Обёртка над polling с безопасным автоматическим перезапуском."""
     while True:
         _diag["polling_attempts"] += 1
         _diag["last_started_at"] = datetime.now(timezone.utc).isoformat()
@@ -897,7 +905,7 @@ async def prodamus_webhook_server():
     app = web.Application()
     app.router.add_post("/prodamus/webhook", handle_prodamus_webhook)
     app.router.add_get("/", lambda request: web.Response(text="ok"))
-    app.router.add_get("/debug", handle_debug)
+    app.router.add_get("/health", lambda request: web.json_response({"status": "ok"}))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
@@ -978,12 +986,20 @@ async def sheets_sync_worker():
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     uid = str(message.from_user.id)
+    existing_sub = None
     if storage:
+        existing_sub = await storage.get_subscription(uid)
         await storage.set_blocked(uid, False)  # написал нам — точно не заблокирован
         name = message.from_user.first_name
         client = await storage.get_client(uid)
-        if not client.get("name"):
-            await storage.upsert_client(uid, name, client.get("profile", {}))
+        await storage.upsert_client(
+            uid,
+            name,
+            client.get("profile", {}),
+            username=message.from_user.username,
+        )
+        if existing_sub is None:
+            await storage.add_event(uid, "bot_started")
 
     if not storage:
         await send_welcome(message.chat.id)
@@ -1042,22 +1058,30 @@ async def cmd_forget(message: Message):
 async def cmd_reset(message: Message):
     if storage:
         await storage.full_reset(str(message.from_user.id))
-    await message.answer("Полный сброс. Начинаем с чистого листа.")
+    await message.answer(
+        "Профиль, история и избранное очищены. Оплата и доступ сохранены."
+    )
 
 # ─── Воронка: колбэки и тестовая оплата ──────────────────────────────────────
 
 @dp.callback_query(F.data == "show_tariffs")
 async def cb_show_tariffs(callback: CallbackQuery):
+    if storage:
+        await storage.add_event(str(callback.from_user.id), "offer_opened")
     await send_tariff_card(callback.message.chat.id)
     await callback.answer()
 
 @dp.callback_query(F.data == "show_new_tariffs")
 async def cb_show_new_tariffs(callback: CallbackQuery):
+    if storage:
+        await storage.add_event(str(callback.from_user.id), "tariff_opened")
     await send_new_tariff_card(callback.message.chat.id, callback.from_user.first_name)
     await callback.answer()
 
 @dp.callback_query(F.data == "show_renewal_tariffs")
 async def cb_show_renewal_tariffs(callback: CallbackQuery):
+    if storage:
+        await storage.add_event(str(callback.from_user.id), "renewal_tariff_opened")
     await send_renewal_tariff_card(callback.message.chat.id, callback.from_user.first_name)
     await callback.answer()
 
@@ -1068,8 +1092,10 @@ async def cb_choose_tier(callback: CallbackQuery):
         await callback.answer("Неизвестный тариф")
         return
     uid = str(callback.from_user.id)
-    name = callback.from_user.first_name or "Привет"
+    name = html.escape(callback.from_user.first_name or "Привет")
     link = await generate_payment_link(uid, tier)
+    if storage and link.startswith("http"):
+        await storage.add_event(uid, "payment_link_created", {"tier": tier})
     # Персонализированный формат по просьбе Назира: ссылка не идёт "голой".
     caption = (
         f"{name}, вот твоя ссылка на оплату 👇\n\n"
@@ -1155,9 +1181,8 @@ async def _run_broadcast(user_ids: list[str], text: str, admin_chat_id: int):
 @dp.message(Command("broadcast"))
 async def cmd_broadcast(message: Message):
     """Рассылка по сегменту: /broadcast сегмент текст сообщения.
-    Сегменты: all (все), paid (активная подписка), unpaid (не платили),
-    expired (истёкшая подписка). Только для админа. Заблокировавших бота
-    юзеров пропускает автоматически. Отправка идёт в фоне с паузами."""
+    Сегменты перечислены в Google Sheets на листе «Сегменты и рассылки».
+    Только для админа. Заблокировавших бота пропускает автоматически."""
     if not storage:
         return
     if not ADMIN_USER_ID or str(message.from_user.id) != ADMIN_USER_ID:
@@ -1170,6 +1195,9 @@ async def cmd_broadcast(message: Message):
             "all — все зарегистрированные\n"
             "paid — активная подписка\n"
             "unpaid — ни разу не платили\n"
+            "firstpaid — оплатили впервые\n"
+            "renewed — оплатили и продлили\n"
+            "notrenewed — оплатили и не продлили\n"
             "expired — подписка истекла"
         )
         return
@@ -1427,6 +1455,7 @@ async def main():
         anthropic_key=ANTHROPIC_API_KEY,
         recipes_data=data,
         model=MODEL,
+        learn_model=LEARN_MODEL,
     )
 
     if GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_SHEET_ID:
