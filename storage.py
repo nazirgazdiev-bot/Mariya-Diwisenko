@@ -7,7 +7,7 @@ SQLite-хранилище МарИИи:
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -100,6 +100,12 @@ class Storage:
                     "ALTER TABLE subscriptions ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0"
                 )
 
+            # Профиль Telegram нужен для выгрузки базы пользователей и сегментов.
+            async with db.execute("PRAGMA table_info(clients)") as cur:
+                client_cols = {row[1] for row in await cur.fetchall()}
+            if "username" not in client_cols:
+                await db.execute("ALTER TABLE clients ADD COLUMN username TEXT")
+
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS payments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,6 +120,34 @@ class Storage:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id, id)"
             )
+            # Prodamus может повторять вебхуки. Один order_id должен учитываться
+            # ровно один раз, иначе дублируются выручка и продления.
+            await db.execute("""
+                DELETE FROM payments
+                WHERE order_id IS NOT NULL AND order_id != ''
+                  AND id NOT IN (
+                    SELECT MIN(id) FROM payments
+                    WHERE order_id IS NOT NULL AND order_id != ''
+                    GROUP BY order_id
+                  )""")
+            await db.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_order_unique
+                ON payments(order_id)
+                WHERE order_id IS NOT NULL AND order_id != ''""")
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    metadata_json TEXT,
+                    created_at TEXT NOT NULL
+                )""")
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_type_date ON events(event_type, created_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id, id)"
+            )
             await db.commit()
 
     @staticmethod
@@ -126,7 +160,7 @@ class Storage:
         """Возвращает профиль клиента + факты. Если клиента нет — пустой шаблон."""
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
-                "SELECT name, profile_json FROM clients WHERE user_id = ?",
+                "SELECT name, username, profile_json FROM clients WHERE user_id = ?",
                 (user_id,),
             ) as cur:
                 row = await cur.fetchone()
@@ -138,16 +172,28 @@ class Storage:
                 facts = [{"id": r[0], "text": r[1]} for r in await cur.fetchall()]
 
         if not row:
-            return {"user_id": user_id, "name": None, "profile": {}, "facts": facts}
+            return {
+                "user_id": user_id, "name": None, "username": None,
+                "profile": {}, "facts": facts,
+            }
 
-        name, profile_json = row
+        name, username, profile_json = row
         try:
             profile = json.loads(profile_json) if profile_json else {}
         except json.JSONDecodeError:
             profile = {}
-        return {"user_id": user_id, "name": name, "profile": profile, "facts": facts}
+        return {
+            "user_id": user_id, "name": name, "username": username,
+            "profile": profile, "facts": facts,
+        }
 
-    async def upsert_client(self, user_id: str, name: str | None, profile: dict):
+    async def upsert_client(
+        self,
+        user_id: str,
+        name: str | None,
+        profile: dict,
+        username: str | None = None,
+    ):
         now = self._now()
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
@@ -156,13 +202,26 @@ class Storage:
                 existing = await cur.fetchone()
             if existing:
                 await db.execute(
-                    "UPDATE clients SET name = COALESCE(?, name), profile_json = ?, updated_at = ? WHERE user_id = ?",
-                    (name, json.dumps(profile, ensure_ascii=False), now, user_id),
+                    """UPDATE clients
+                       SET name = COALESCE(?, name),
+                           username = COALESCE(?, username),
+                           profile_json = ?,
+                           updated_at = ?
+                       WHERE user_id = ?""",
+                    (
+                        name, username, json.dumps(profile, ensure_ascii=False),
+                        now, user_id,
+                    ),
                 )
             else:
                 await db.execute(
-                    "INSERT INTO clients (user_id, name, profile_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                    (user_id, name, json.dumps(profile, ensure_ascii=False), now, now),
+                    """INSERT INTO clients
+                       (user_id, name, username, profile_json, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        user_id, name, username,
+                        json.dumps(profile, ensure_ascii=False), now, now,
+                    ),
                 )
             await db.commit()
 
@@ -222,12 +281,31 @@ class Storage:
             await db.commit()
 
     async def full_reset(self, user_id: str):
+        """Сбрасывает персонализацию, но никогда не удаляет оплату и доступ."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("DELETE FROM dialog WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM facts WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM clients WHERE user_id = ?", (user_id,))
             await db.execute("DELETE FROM favorites WHERE user_id = ?", (user_id,))
-            await db.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
+            await db.commit()
+
+    # ---------- События воронки ----------
+
+    async def add_event(
+        self,
+        user_id: str,
+        event_type: str,
+        metadata: dict | None = None,
+    ):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """INSERT INTO events (user_id, event_type, metadata_json, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    user_id, event_type,
+                    json.dumps(metadata or {}, ensure_ascii=False), self._now(),
+                ),
+            )
             await db.commit()
 
     # ---------- Подписки / воронка ----------
@@ -426,21 +504,284 @@ class Storage:
             )
             await db.commit()
 
+    async def payment_exists(self, order_id: str | None) -> bool:
+        if not order_id:
+            return False
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT 1 FROM payments WHERE order_id = ? LIMIT 1", (order_id,)
+            ) as cur:
+                return await cur.fetchone() is not None
+
+    async def activate_payment(
+        self,
+        *,
+        user_id: str,
+        tier: str,
+        paid_until: str,
+        renewal_next_at: str | None,
+        amount: float | None,
+        commission_sum: float | None,
+        order_id: str | None,
+    ) -> bool:
+        """Атомарно записывает оплату и открывает доступ.
+
+        Возвращает False, если order_id уже был обработан. Это защищает
+        подписку, выручку и метрики от повторных вебхуков Prodamus.
+        """
+        now = self._now()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            if order_id:
+                async with db.execute(
+                    "SELECT 1 FROM payments WHERE order_id = ? LIMIT 1",
+                    (order_id,),
+                ) as cur:
+                    if await cur.fetchone():
+                        await db.rollback()
+                        return False
+
+            async with db.execute(
+                "SELECT 1 FROM subscriptions WHERE user_id = ?", (user_id,)
+            ) as cur:
+                exists = await cur.fetchone()
+            if exists:
+                await db.execute(
+                    """UPDATE subscriptions
+                       SET status = 'active', tier = ?, paid_until = ?,
+                           funnel_next_at = NULL, renewal_reminder_sent = 0,
+                           renewal_stage = 0, renewal_next_at = ?,
+                           updated_at = ?
+                       WHERE user_id = ?""",
+                    (tier, paid_until, renewal_next_at, now, user_id),
+                )
+            else:
+                await db.execute(
+                    """INSERT INTO subscriptions
+                       (user_id, status, tier, paid_until, funnel_step,
+                        funnel_next_at, renewal_reminder_sent, renewal_stage,
+                        renewal_next_at, blocked, created_at, updated_at)
+                       VALUES (?, 'active', ?, ?, 0, NULL, 0, 0, ?, 0, ?, ?)""",
+                    (user_id, tier, paid_until, renewal_next_at, now, now),
+                )
+
+            await db.execute(
+                """INSERT INTO payments
+                   (user_id, tier, amount, commission_sum, order_id, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, 'success', ?)""",
+                (
+                    user_id, tier, amount, commission_sum,
+                    order_id or "", now,
+                ),
+            )
+            await db.execute(
+                """INSERT INTO events (user_id, event_type, metadata_json, created_at)
+                   VALUES (?, 'payment_success', ?, ?)""",
+                (
+                    user_id,
+                    json.dumps({"tier": tier, "order_id": order_id or ""}),
+                    now,
+                ),
+            )
+            await db.commit()
+            return True
+
     # ---------- Сегменты для рассылок ----------
 
-    async def users_in_segment(self, status: str | None) -> list[str]:
-        """user_id всех незаблокировавших бота юзеров. status=None — все,
-        иначе фильтр по конкретному статусу подписки (active/trial/expired)."""
+    async def users_in_segment(self, segment: str | None) -> list[str]:
+        """Получатели рассылки по понятному бизнес-сегменту."""
         async with aiosqlite.connect(self.db_path) as db:
-            if status is None:
+            if segment in (None, "all"):
                 query = "SELECT user_id FROM subscriptions WHERE blocked = 0"
                 params: tuple = ()
+            elif segment == "firstpaid":
+                query = """
+                    SELECT s.user_id
+                    FROM subscriptions s
+                    JOIN payments p ON p.user_id = s.user_id AND p.status = 'success'
+                    WHERE s.blocked = 0 AND s.status = 'active'
+                    GROUP BY s.user_id
+                    HAVING COUNT(p.id) = 1"""
+                params = ()
+            elif segment == "renewed":
+                query = """
+                    SELECT s.user_id
+                    FROM subscriptions s
+                    JOIN payments p ON p.user_id = s.user_id AND p.status = 'success'
+                    WHERE s.blocked = 0
+                    GROUP BY s.user_id
+                    HAVING COUNT(p.id) >= 2"""
+                params = ()
+            elif segment == "notrenewed":
+                query = """
+                    SELECT s.user_id
+                    FROM subscriptions s
+                    JOIN payments p ON p.user_id = s.user_id AND p.status = 'success'
+                    WHERE s.blocked = 0 AND s.status = 'expired'
+                    GROUP BY s.user_id
+                    HAVING COUNT(p.id) = 1"""
+                params = ()
             else:
                 query = "SELECT user_id FROM subscriptions WHERE blocked = 0 AND status = ?"
-                params = (status,)
+                params = (segment,)
             async with db.execute(query, params) as cur:
                 rows = await cur.fetchall()
         return [r[0] for r in rows]
+
+    async def report_snapshot(self) -> dict:
+        """Данные для Google Sheets: пользователи, дневная сводка и сегменты."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("""
+                SELECT
+                    s.user_id,
+                    COALESCE(c.name, ''),
+                    COALESCE(c.username, ''),
+                    s.created_at,
+                    s.status,
+                    COALESCE(s.tier, ''),
+                    s.paid_until,
+                    s.blocked,
+                    COUNT(CASE WHEN p.status = 'success' THEN 1 END),
+                    MIN(CASE WHEN p.status = 'success' THEN p.created_at END),
+                    MAX(CASE WHEN p.status = 'success' THEN p.created_at END),
+                    COALESCE(SUM(CASE WHEN p.status = 'success' THEN p.amount ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN p.status = 'success' THEN p.commission_sum ELSE 0 END), 0)
+                FROM subscriptions s
+                LEFT JOIN clients c ON c.user_id = s.user_id
+                LEFT JOIN payments p ON p.user_id = s.user_id
+                GROUP BY s.user_id
+                ORDER BY s.created_at DESC
+            """) as cur:
+                rows = await cur.fetchall()
+
+            users = []
+            for row in rows:
+                (
+                    user_id, name, username, registered_at, status, tier,
+                    paid_until, blocked, payment_count, first_paid_at,
+                    last_paid_at, revenue, commission,
+                ) = row
+                if payment_count >= 2:
+                    segment = "Оплатил и продлил"
+                elif payment_count == 1 and status == "expired":
+                    segment = "Оплатил и не продлил"
+                elif payment_count == 1:
+                    segment = "Оплатил впервые"
+                else:
+                    segment = "Зашёл и не оплатил"
+                users.append({
+                    "registered_at": registered_at,
+                    "user_id": user_id,
+                    "name": name,
+                    "username": username,
+                    "status": status,
+                    "segment": segment,
+                    "tier": tier,
+                    "paid_until": paid_until,
+                    "payment_count": payment_count,
+                    "first_paid_at": first_paid_at,
+                    "last_paid_at": last_paid_at,
+                    "revenue": revenue or 0,
+                    "commission": commission or 0,
+                    "net": (revenue or 0) - (commission or 0),
+                    "blocked": bool(blocked),
+                })
+
+            async with db.execute("""
+                SELECT substr(created_at, 1, 10), COUNT(DISTINCT user_id)
+                FROM subscriptions
+                WHERE created_at IS NOT NULL
+                GROUP BY substr(created_at, 1, 10)
+            """) as cur:
+                registrations = dict(await cur.fetchall())
+
+            async with db.execute("""
+                SELECT
+                    substr(created_at, 1, 10),
+                    COUNT(*),
+                    COUNT(DISTINCT user_id),
+                    COALESCE(SUM(amount), 0),
+                    COALESCE(SUM(commission_sum), 0)
+                FROM payments
+                WHERE status = 'success'
+                GROUP BY substr(created_at, 1, 10)
+            """) as cur:
+                payments_by_day = {
+                    row[0]: {
+                        "payments": row[1],
+                        "buyers": row[2],
+                        "revenue": row[3] or 0,
+                        "commission": row[4] or 0,
+                    }
+                    for row in await cur.fetchall()
+                }
+
+            async with db.execute("""
+                SELECT
+                    day,
+                    SUM(CASE WHEN payment_number = 1 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN payment_number > 1 THEN 1 ELSE 0 END)
+                FROM (
+                    SELECT
+                        substr(created_at, 1, 10) AS day,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY user_id ORDER BY id
+                        ) AS payment_number
+                    FROM payments
+                    WHERE status = 'success'
+                )
+                GROUP BY day
+            """) as cur:
+                payment_types = {
+                    row[0]: {
+                        "first_payments": row[1] or 0,
+                        "renewals": row[2] or 0,
+                    }
+                    for row in await cur.fetchall()
+                }
+
+            async with db.execute("""
+                SELECT substr(created_at, 1, 10), COUNT(DISTINCT user_id)
+                FROM events
+                WHERE event_type = 'tariff_opened'
+                GROUP BY substr(created_at, 1, 10)
+            """) as cur:
+                tariff_opens = dict(await cur.fetchall())
+
+            async with db.execute("""
+                SELECT substr(created_at, 1, 10), COUNT(DISTINCT user_id)
+                FROM events
+                WHERE event_type = 'payment_link_created'
+                GROUP BY substr(created_at, 1, 10)
+            """) as cur:
+                payment_links = dict(await cur.fetchall())
+
+        dates = sorted(
+            set(registrations) | set(payments_by_day)
+            | set(tariff_opens) | set(payment_links),
+            reverse=True,
+        )
+        daily = []
+        for day in dates:
+            p = payments_by_day.get(day, {})
+            payment_type = payment_types.get(day, {})
+            registrations_count = registrations.get(day, 0)
+            buyers = p.get("buyers", 0)
+            daily.append({
+                "date": day,
+                "registrations": registrations_count,
+                "tariff_opens": tariff_opens.get(day, 0),
+                "payment_links": payment_links.get(day, 0),
+                "payments": p.get("payments", 0),
+                "first_payments": payment_type.get("first_payments", 0),
+                "renewals": payment_type.get("renewals", 0),
+                "buyers": buyers,
+                "revenue": p.get("revenue", 0),
+                "commission": p.get("commission", 0),
+                "net": p.get("revenue", 0) - p.get("commission", 0),
+                "conversion": buyers / registrations_count if registrations_count else 0,
+            })
+        return {"users": users, "daily": daily}
 
     # ---------- Метрики для дашборда Google Sheets ----------
 
