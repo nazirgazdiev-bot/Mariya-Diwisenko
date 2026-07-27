@@ -1113,14 +1113,18 @@ async def cb_choose_tier(callback: CallbackQuery):
 
 @dp.message(Command("testpay"))
 async def cmd_testpay(message: Message):
-    """Тестовая заглушка оплаты: /testpay 1m|3m|6m. Доступна админу, а также
-    ВСЕМ, когда включён тест пост-оплатной серии (RENEWAL_TEST_INTERVAL_SEC>0)
-    — чтобы Назир мог сам выдать себе доступ и посмотреть рецепты/МарИИю и
-    серию сообщений после оплаты. Будет удалена после подключения вебхука."""
+    """Тестовая заглушка оплаты: /testpay 1m|3m|6m.
+
+    В production команда полностью выключена при TESTPAY_OPEN=0, в том числе
+    для администратора. Ускоренный тест серии продления отдельно разрешается
+    только при RENEWAL_TEST_INTERVAL_SEC>0.
+    """
     if not storage:
         return
     is_admin = ADMIN_USER_ID and str(message.from_user.id) == ADMIN_USER_ID
-    if not is_admin and not TESTPAY_OPEN and RENEWAL_TEST_INTERVAL <= 0:
+    if not TESTPAY_OPEN and RENEWAL_TEST_INTERVAL <= 0:
+        return
+    if not is_admin and RENEWAL_TEST_INTERVAL <= 0:
         return
     parts = message.text.split()
     tier = parts[1] if len(parts) > 1 else "1m"
