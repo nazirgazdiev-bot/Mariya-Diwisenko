@@ -31,7 +31,15 @@ DB_PATH = os.environ.get("DB_PATH", "mariya_data.db")
 MENU_PATH = os.environ.get("MENU_PATH", "menu.json")
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 LEARN_MODEL = os.environ.get("LEARN_MODEL", "claude-haiku-4-5-20251001")
-ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID")  # для тестовой команды /testpay
+ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID")  # legacy: один администратор
+ADMIN_USER_IDS = {
+    user_id.strip()
+    for user_id in os.environ.get("ADMIN_USER_IDS", ADMIN_USER_ID or "").split(",")
+    if user_id.strip()
+}
+
+def user_is_admin(user_id: int | str) -> bool:
+    return str(user_id) in ADMIN_USER_IDS
 PRODAMUS_SECRET_KEY = os.environ.get("PRODAMUS_SECRET_KEY")
 PRODAMUS_SHOP_URL = os.environ.get("PRODAMUS_SHOP_URL", "https://pprecepty.payform.ru/")
 WEBHOOK_PORT = int(os.environ.get("PORT", 8080))
@@ -193,9 +201,9 @@ def dbg_delay(real_delay):
     return FUNNEL_TEST_INTERVAL if FUNNEL_TEST_MODE else real_delay
 
 TIERS = {
-    "1m": {"title": "1 месяц — 1690₽", "label": "1 месяц", "days": 30, "price": 1690},
-    "3m": {"title": "3 месяца — 3990₽ (выгоднее на 20%)", "label": "3 месяца", "days": 90, "price": 3990},
-    "6m": {"title": "6 месяцев — 6990₽ (выгоднее на 30%)", "label": "6 месяцев", "days": 180, "price": 6990},
+    "1m": {"title": "1 месяц — 1290₽", "label": "1 месяц", "days": 30, "price": 1290},
+    "3m": {"title": "3 месяца — 3490₽ (экономия 380₽)", "label": "3 месяца", "days": 90, "price": 3490},
+    "6m": {"title": "6 месяцев — 5990₽ (экономия 1750₽)", "label": "6 месяцев", "days": 180, "price": 5990},
 }
 
 # Сегменты для /broadcast: ключ команды -> бизнес-сегмент в Storage.
@@ -234,10 +242,11 @@ TARIFF_CARD_TEXT = (
     "и собирает тебе готовый рацион на день, неделю или месяц. Под твои цели, "
     "вкусы и даже аллергии. И всё это — только из моих проверенных рецептов.\n\n"
     "Это как иметь меня в кармане в режиме 24/7 🤍\n\n"
+    "<b>Для тех, кто уже покупал мои продукты — специальные цены 🤍</b>\n\n"
     "<b>Выбирай доступ и погнали 👇</b>\n"
-    "▪️ 1 месяц — 1690 ₽\n"
-    "▪️ 3 месяца — 3990 ₽ (выгоднее на 20%)\n"
-    "▪️ 6 месяцев — 6990 ₽ (выгоднее на 30%)"
+    "▪️ 1 месяц — 1290 ₽\n"
+    "▪️ 3 месяца — 3490 ₽ (экономия 380 ₽)\n"
+    "▪️ 6 месяцев — 5990 ₽ (экономия 1750 ₽)"
 )
 
 DOZHIM_1_TEXT = (
@@ -280,7 +289,7 @@ DOZHIM_4_TEXT = (
     "и не марафон, где нужно успевать. Это инструмент, который просто всегда под рукой.\n\n"
     "Захотела рецепт — открыла. Нужно меню — спросила МарИИю. Никаких дедлайнов "
     "и чувства вины, что ты что-то не успела.\n\n"
-    "1690 ₽ в месяц — это меньше, чем ты тратишь на спонтанные продукты, которые "
+    "1290 ₽ в месяц — это меньше, чем ты тратишь на спонтанные продукты, которые "
     "покупаешь, не зная что готовить, и которые потом портятся в холодильнике.\n\n"
     "<b>Попробуй, не понравится — верну деньги 👇</b>"
 )
@@ -338,9 +347,9 @@ RENEWAL_3D_TEXT = (
     "За это время МарИИя наверняка стала твоим помощником — считала КБЖУ, "
     "собирала меню, избавляла от вечного «что готовить».\n\n"
     "<b>Чтобы ничего из этого не потерять — продли доступ заранее 👇</b>\n\n"
-    "▪️ 1 месяц — 1690₽\n"
-    "▪️ 3 месяца — 3990₽ (выгоднее на 20%)\n"
-    "▪️ 6 месяцев — 6990₽ (выгоднее на 30%)"
+    "▪️ 1 месяц — 1290₽\n"
+    "▪️ 3 месяца — 3490₽ (экономия 380₽)\n"
+    "▪️ 6 месяцев — 5990₽ (экономия 1750₽)"
 )
 
 RENEWAL_1D_TEXT = (
@@ -378,16 +387,17 @@ RENEWAL_WINBACK_TEXT = (
 
 NEW_TARIFF_TEXT_TMPL = (
     "<b>🤍 {name}, выбери тариф для оформления подписки:</b>\n\n"
-    "▪️ 1 месяц — 1690₽\n"
-    "▪️ 3 месяца — 3990₽ (выгоднее на 20%)\n"
-    "▪️ 6 месяцев — 6990₽ (выгоднее на 30%)"
+    "<b>Для тех, кто уже покупал мои продукты — специальные цены:</b>\n\n"
+    "▪️ 1 месяц — 1290₽\n"
+    "▪️ 3 месяца — 3490₽ (экономия 380₽)\n"
+    "▪️ 6 месяцев — 5990₽ (экономия 1750₽)"
 )
 
 RENEWAL_TARIFF_TEXT_TMPL = (
     "<b>🤍 {name}, выбери тариф для продления подписки:</b>\n\n"
-    "▪️ 1 месяц — 1690₽\n"
-    "▪️ 3 месяца — 3990₽ (выгоднее на 20%)\n"
-    "▪️ 6 месяцев — 6990₽ (выгоднее на 30%)"
+    "▪️ 1 месяц — 1290₽\n"
+    "▪️ 3 месяца — 3490₽ (экономия 380₽)\n"
+    "▪️ 6 месяцев — 5990₽ (экономия 1750₽)"
 )
 
 # Этап 1: за 3 дня в 12:00 МСК | 2: за 1 день в 12:00 МСК |
@@ -402,7 +412,8 @@ RENEWAL_STAGE_TEXTS = {
     5: RENEWAL_WINBACK_TEXT,
 }
 RENEWAL_STAGE_PHOTOS = {
-    1: "renewal_3days.png",
+    # Карточка с ценами временно отключена: на ней остались старые тарифы.
+    1: None,
     2: "renewal_1day.png",
     3: "renewal_dayof.png",
     4: None,  # в Miro у этой карточки нет картинки — только текст
@@ -573,7 +584,7 @@ async def _sheets_write_dashboard():
 
 
 def _to_float(value) -> float | None:
-    """Продамус присылает числа строками ('1690.00' и т.п.) — безопасный парсинг."""
+    """Продамус присылает числа строками ('1290.00' и т.п.) — безопасный парсинг."""
     if value is None or value == "":
         return None
     try:
@@ -646,24 +657,18 @@ async def send_tariff_card(chat_id: int):
         await bot.send_message(chat_id, TARIFF_CARD_TEXT, reply_markup=kb)
 
 async def send_new_tariff_card(chat_id: int, name: str | None):
-    """Карточка выбора тарифа для НОВОЙ подписки ('для оформления', фото
-    new_tariff_card.png — 'Выбери тариф для подписки') — шлют сюда шаг 2
-    (по кнопке 'Оплатить доступ') и все дожимы 3-9. Отдельная от карточки
-    продления, у неё своё фото и текст."""
+    """Выбор тарифа для новой подписки.
+
+    Временно отправляется без старой карточки с ценами: актуальные спеццены
+    находятся в тексте и в кнопках оплаты.
+    """
     text = NEW_TARIFF_TEXT_TMPL.format(name=html.escape(name or "Привет"))
-    new_tariff_photo = os.path.join(PHOTOS_DIR, "new_tariff_card.png")
-    if os.path.exists(new_tariff_photo):
-        await bot.send_photo(chat_id, FSInputFile(new_tariff_photo), caption=text, reply_markup=tariffs_keyboard())
-    else:
-        await bot.send_message(chat_id, text, reply_markup=tariffs_keyboard())
+    await bot.send_message(chat_id, text, reply_markup=tariffs_keyboard())
 
 async def send_renewal_tariff_card(chat_id: int, name: str | None):
     text = RENEWAL_TARIFF_TEXT_TMPL.format(name=html.escape(name or "Привет"))
-    photo_path = os.path.join(PHOTOS_DIR, "renewal_tariff_card.png")
-    if os.path.exists(photo_path):
-        await bot.send_photo(chat_id, FSInputFile(photo_path), caption=text, reply_markup=tariffs_keyboard())
-    else:
-        await bot.send_message(chat_id, text, reply_markup=tariffs_keyboard())
+    # Фото-карточка временно отключена, потому что на ней старые цены.
+    await bot.send_message(chat_id, text, reply_markup=tariffs_keyboard())
 
 async def send_renewal_stage(chat_id: int, stage: int):
     text = RENEWAL_STAGE_TEXTS[stage]
@@ -725,12 +730,10 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
             await bot.send_message(chat_id, DOZHIM_5_TEXT, reply_markup=kb)
         return 7, dbg_delay(seconds_until_msk(0, 19))  # день 2 в 19 МСК (тот же день)
     if step == 7:
-        price_photo = os.path.join(PHOTOS_DIR, "dozhim4_price.png")
         kb = pay_cta_keyboard("Попробовать бота")
-        if os.path.exists(price_photo):
-            await bot.send_photo(chat_id, FSInputFile(price_photo), caption=DOZHIM_4_TEXT, reply_markup=kb)
-        else:
-            await bot.send_message(chat_id, DOZHIM_4_TEXT, reply_markup=kb)
+        # Старая картинка содержала цену 1690 ₽/мес, поэтому на время акции
+        # отправляем актуальный текст без неё.
+        await bot.send_message(chat_id, DOZHIM_4_TEXT, reply_markup=kb)
         return 8, dbg_delay(seconds_until_msk(1, 17))  # день 3 в 17 МСК
     if step == 8:
         testimonial_photo = os.path.join(PHOTOS_DIR, "dozhim2_testimonial.png")
@@ -1121,7 +1124,7 @@ async def cmd_testpay(message: Message):
     """
     if not storage:
         return
-    is_admin = ADMIN_USER_ID and str(message.from_user.id) == ADMIN_USER_ID
+    is_admin = user_is_admin(message.from_user.id)
     if not TESTPAY_OPEN and RENEWAL_TEST_INTERVAL <= 0:
         return
     if not is_admin and RENEWAL_TEST_INTERVAL <= 0:
@@ -1189,7 +1192,7 @@ async def cmd_broadcast(message: Message):
     Только для админа. Заблокировавших бота пропускает автоматически."""
     if not storage:
         return
-    if not ADMIN_USER_ID or str(message.from_user.id) != ADMIN_USER_ID:
+    if not user_is_admin(message.from_user.id):
         return
     parts = message.text.split(maxsplit=2)
     if len(parts) < 3 or parts[1] not in BROADCAST_SEGMENTS:
