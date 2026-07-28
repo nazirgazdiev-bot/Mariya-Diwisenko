@@ -621,6 +621,9 @@ _diag["testpay_open"] = TESTPAY_OPEN
 
 async def has_access(user_id: str) -> bool:
     """Активна ли подписка. Просроченную active сразу переводит в expired."""
+    # Администраторы имеют постоянный доступ без покупки и paid_until.
+    if user_is_admin(user_id):
+        return True
     if not storage:
         return True  # без БД пейволл не работает — не блокируем бота
     sub = await storage.get_subscription(user_id)
