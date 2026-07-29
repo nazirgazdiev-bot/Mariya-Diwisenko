@@ -13,7 +13,7 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
-    Message, ReplyKeyboardRemove,
+    KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiohttp import web
@@ -70,26 +70,21 @@ CATEGORIES = list(STRUCTURE.keys())
 
 # ─── Клавиатуры ──────────────────────────────────────────────────────────────
 
-def main_nav_rows():
-    return [
-        [
-            InlineKeyboardButton(text="🍽 Рецепты", callback_data="nav:recipes"),
-            InlineKeyboardButton(text="⭐ Избранное", callback_data="nav:favorites"),
-        ],
-        [InlineKeyboardButton(text="🤖 Спросить МарИИю", callback_data="nav:mariya")],
-    ]
-
-
 def main_keyboard():
-    """Inline-навигация не создаёт в чате сообщения от имени пользователя."""
-    return InlineKeyboardMarkup(inline_keyboard=main_nav_rows())
+    """Постоянное нижнее меню Telegram."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🍽 Рецепты"), KeyboardButton(text="⭐ Избранное")],
+            [KeyboardButton(text="🤖 Спросить МарИИю")],
+        ],
+        resize_keyboard=True,
+    )
 
 def categories_keyboard():
     buttons = [
         [InlineKeyboardButton(text=cat, callback_data=f"cat:{i}")]
         for i, cat in enumerate(CATEGORIES)
     ]
-    buttons.extend(main_nav_rows())
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def subcategories_keyboard(cat_idx: int):
@@ -100,7 +95,6 @@ def subcategories_keyboard(cat_idx: int):
         for j, sub in enumerate(subcats)
     ]
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back:main")])
-    buttons.extend(main_nav_rows())
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def recipes_keyboard(cat_idx: int, sub_idx: int):
@@ -123,7 +117,6 @@ def recipes_keyboard(cat_idx: int, sub_idx: int):
                 )
             ])
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"back:cat:{cat_idx}")])
-    buttons.extend(main_nav_rows())
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def recipe_keyboard(cat_idx: int, sub_idx: int, recipe_id: str | None = None, is_fav: bool = False):
@@ -134,7 +127,6 @@ def recipe_keyboard(cat_idx: int, sub_idx: int, recipe_id: str | None = None, is
             callback_data=f"fav:{'del' if is_fav else 'add'}:{recipe_id}",
         )])
     rows.append([InlineKeyboardButton(text="◀️ Назад к списку", callback_data=f"back:sub:{cat_idx}:{sub_idx}")])
-    rows.extend(main_nav_rows())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ─── Фото рецептов ────────────────────────────────────────────────────────────
@@ -667,19 +659,6 @@ async def delete_trigger_message(message: Message):
         log.info("Не удалось удалить legacy-сообщение %s: %s", message.message_id, error)
 
 
-async def remove_legacy_reply_keyboard(chat_id: int):
-    """Однократно убирает старую нижнюю reply-клавиатуру у существующего чата."""
-    try:
-        sent = await bot.send_message(
-            chat_id,
-            "Обновляю меню…",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        await bot.delete_message(chat_id, sent.message_id)
-    except Exception:
-        log.exception("Не удалось убрать старую reply-клавиатуру chat_id=%s", chat_id)
-
-
 async def delete_callback_origin(callback: CallbackQuery):
     """Удаляет экран, на inline-кнопке которого нажал пользователь."""
     try:
@@ -1134,7 +1113,6 @@ async def sheets_sync_worker():
 @serialized_ui
 async def cmd_start(message: Message):
     uid = str(message.from_user.id)
-    await remove_legacy_reply_keyboard(message.chat.id)
     existing_sub = None
     if storage:
         await enter_recipe_mode(uid, message.chat.id)
@@ -1416,7 +1394,6 @@ async def send_favorites_screen(user_id: str, chat_id: int):
             buttons.append([
                 InlineKeyboardButton(text=name, callback_data=f"rec:{rid}")
             ])
-        buttons.extend(main_nav_rows())
         sent = await bot.send_message(
             chat_id,
             "⭐ <b>Твоё избранное:</b>",
@@ -1463,7 +1440,6 @@ async def show_favorites(message: Message):
         await send_tariff_card(message.chat.id)
         return
     await delete_trigger_message(message)
-    await remove_legacy_reply_keyboard(message.chat.id)
     await send_favorites_screen(uid, message.chat.id)
 
 @dp.message(F.text == "🍽 Рецепты")
@@ -1474,7 +1450,6 @@ async def show_categories(message: Message):
         await send_tariff_card(message.chat.id)
         return
     await delete_trigger_message(message)
-    await remove_legacy_reply_keyboard(message.chat.id)
     await send_categories_screen(uid, message.chat.id)
 
 
@@ -1698,7 +1673,6 @@ async def mariya_intro(message: Message):
         await send_tariff_card(message.chat.id)
         return
     await delete_trigger_message(message)
-    await remove_legacy_reply_keyboard(message.chat.id)
     await send_mariya_screen(uid, message.chat.id)
 
 @dp.message(F.text)
