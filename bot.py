@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import html
 import json
 import logging
@@ -12,7 +13,7 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, Message, ReplyKeyboardMarkup,
+    Message, ReplyKeyboardRemove,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiohttp import web
@@ -69,20 +70,26 @@ CATEGORIES = list(STRUCTURE.keys())
 
 # ─── Клавиатуры ──────────────────────────────────────────────────────────────
 
-def main_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🍽 Рецепты"), KeyboardButton(text="⭐ Избранное")],
-            [KeyboardButton(text="🤖 Спросить МарИИю")],
+def main_nav_rows():
+    return [
+        [
+            InlineKeyboardButton(text="🍽 Рецепты", callback_data="nav:recipes"),
+            InlineKeyboardButton(text="⭐ Избранное", callback_data="nav:favorites"),
         ],
-        resize_keyboard=True,
-    )
+        [InlineKeyboardButton(text="🤖 Спросить МарИИю", callback_data="nav:mariya")],
+    ]
+
+
+def main_keyboard():
+    """Inline-навигация не создаёт в чате сообщения от имени пользователя."""
+    return InlineKeyboardMarkup(inline_keyboard=main_nav_rows())
 
 def categories_keyboard():
     buttons = [
         [InlineKeyboardButton(text=cat, callback_data=f"cat:{i}")]
         for i, cat in enumerate(CATEGORIES)
     ]
+    buttons.extend(main_nav_rows())
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def subcategories_keyboard(cat_idx: int):
@@ -93,6 +100,7 @@ def subcategories_keyboard(cat_idx: int):
         for j, sub in enumerate(subcats)
     ]
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back:main")])
+    buttons.extend(main_nav_rows())
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def recipes_keyboard(cat_idx: int, sub_idx: int):
@@ -115,6 +123,7 @@ def recipes_keyboard(cat_idx: int, sub_idx: int):
                 )
             ])
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"back:cat:{cat_idx}")])
+    buttons.extend(main_nav_rows())
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def recipe_keyboard(cat_idx: int, sub_idx: int, recipe_id: str | None = None, is_fav: bool = False):
@@ -125,6 +134,7 @@ def recipe_keyboard(cat_idx: int, sub_idx: int, recipe_id: str | None = None, is
             callback_data=f"fav:{'del' if is_fav else 'add'}:{recipe_id}",
         )])
     rows.append([InlineKeyboardButton(text="◀️ Назад к списку", callback_data=f"back:sub:{cat_idx}:{sub_idx}")])
+    rows.extend(main_nav_rows())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ─── Фото рецептов ────────────────────────────────────────────────────────────
@@ -604,6 +614,18 @@ dp = Dispatcher()
 storage: Storage = None
 mariya: Mariya = None
 sheets_client: SheetsClient | None = None
+_ui_locks: dict[str, asyncio.Lock] = {}
+
+
+def serialized_ui(handler):
+    """Не даёт двум быстрым нажатиям одного пользователя менять экран параллельно."""
+    @functools.wraps(handler)
+    async def wrapper(event, *args, **kwargs):
+        user_id = str(event.from_user.id)
+        lock = _ui_locks.setdefault(user_id, asyncio.Lock())
+        async with lock:
+            return await handler(event, *args, **kwargs)
+    return wrapper
 
 
 async def clear_open_recipe(user_id: str, chat_id: int):
@@ -636,12 +658,33 @@ async def clear_open_menu(user_id: str, chat_id: int):
 
 
 async def delete_trigger_message(message: Message):
-    """Убирает маленькое сообщение от reply-кнопки после его обработки."""
+    """Пытается убрать последнее сообщение старой reply-клавиатуры."""
     try:
         await bot.delete_message(message.chat.id, message.message_id)
+    except Exception as error:
+        # Telegram не гарантирует удаление входящих сообщений в личном чате.
+        # После первого legacy-нажатия reply-клавиатура будет снята навсегда.
+        log.info("Не удалось удалить legacy-сообщение %s: %s", message.message_id, error)
+
+
+async def remove_legacy_reply_keyboard(chat_id: int):
+    """Однократно убирает старую нижнюю reply-клавиатуру у существующего чата."""
+    try:
+        sent = await bot.send_message(
+            chat_id,
+            "Обновляю меню…",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await bot.delete_message(chat_id, sent.message_id)
     except Exception:
-        # В личном чате бот может удалять входящие сообщения. Если Telegram
-        # временно отказал или сообщение уже удалено, основной сценарий живёт.
+        log.exception("Не удалось убрать старую reply-клавиатуру chat_id=%s", chat_id)
+
+
+async def delete_callback_origin(callback: CallbackQuery):
+    """Удаляет экран, на inline-кнопке которого нажал пользователь."""
+    try:
+        await callback.message.delete()
+    except Exception:
         pass
 
 
@@ -1088,8 +1131,10 @@ async def sheets_sync_worker():
 # ─── Команды ─────────────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
+@serialized_ui
 async def cmd_start(message: Message):
     uid = str(message.from_user.id)
+    await remove_legacy_reply_keyboard(message.chat.id)
     existing_sub = None
     if storage:
         await enter_recipe_mode(uid, message.chat.id)
@@ -1350,7 +1395,66 @@ async def toggle_favorite(callback: CallbackQuery):
             pass
     await callback.answer(note)
 
+
+async def send_favorites_screen(user_id: str, chat_id: int):
+    await enter_recipe_mode(user_id, chat_id)
+    fav_ids = [r for r in await storage.get_favorites(user_id) if r in RECIPES]
+    if not fav_ids:
+        sent = await bot.send_message(
+            chat_id,
+            "⭐ <b>Избранное пустое</b>\n\n"
+            "Открой любой рецепт и нажми «⭐ В избранное» — он появится здесь, "
+            "чтобы был всегда под рукой.",
+            reply_markup=main_keyboard(),
+        )
+    else:
+        buttons = []
+        for rid in fav_ids:
+            name = RECIPES[rid]["name"]
+            if len(name) > 40:
+                name = name[:37] + "..."
+            buttons.append([
+                InlineKeyboardButton(text=name, callback_data=f"rec:{rid}")
+            ])
+        buttons.extend(main_nav_rows())
+        sent = await bot.send_message(
+            chat_id,
+            "⭐ <b>Твоё избранное:</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+    await storage.set_menu_message_ids(user_id, [sent.message_id])
+
+
+async def send_categories_screen(user_id: str, chat_id: int):
+    await enter_recipe_mode(user_id, chat_id)
+    sent = await bot.send_message(
+        chat_id,
+        "📂 <b>Выбери категорию:</b>",
+        reply_markup=categories_keyboard(),
+    )
+    await storage.set_menu_message_ids(user_id, [sent.message_id])
+
+
+async def send_mariya_screen(user_id: str, chat_id: int):
+    await enter_recipe_mode(user_id, chat_id)
+    await storage.set_mariya_mode(user_id, True)
+    sent = await bot.send_message(
+        chat_id,
+        "🤖 <b>МарИИя — AI-нутрициолог</b>\n\n"
+        "Я помогу:\n"
+        "• Посчитать твою норму КБЖУ\n"
+        "• Составить рацион по твоим целям\n"
+        "• Подобрать рецепты под аллергии и предпочтения\n\n"
+        "Просто напиши что тебе нужно 👇\n\n"
+        "<i>Команды: /profile — профиль | /forget — очистить диалог | "
+        "/reset — полный сброс</i>",
+        reply_markup=main_keyboard(),
+    )
+    await storage.set_menu_message_ids(user_id, [sent.message_id])
+
+
 @dp.message(F.text == "⭐ Избранное")
+@serialized_ui
 async def show_favorites(message: Message):
     if not storage:
         return
@@ -1359,43 +1463,61 @@ async def show_favorites(message: Message):
         await send_tariff_card(message.chat.id)
         return
     await delete_trigger_message(message)
-    await enter_recipe_mode(uid, message.chat.id)
-    fav_ids = [r for r in await storage.get_favorites(uid) if r in RECIPES]
-    if not fav_ids:
-        sent = await message.answer(
-            "⭐ <b>Избранное пустое</b>\n\n"
-            "Открой любой рецепт и нажми «⭐ В избранное» — он появится здесь, "
-            "чтобы был всегда под рукой."
-        )
-        await storage.set_menu_message_ids(uid, [sent.message_id])
-        return
-    buttons = []
-    for rid in fav_ids:
-        name = RECIPES[rid]["name"]
-        if len(name) > 40:
-            name = name[:37] + "..."
-        buttons.append([InlineKeyboardButton(text=name, callback_data=f"rec:{rid}")])
-    sent = await message.answer(
-        "⭐ <b>Твоё избранное:</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-    )
-    await storage.set_menu_message_ids(uid, [sent.message_id])
+    await remove_legacy_reply_keyboard(message.chat.id)
+    await send_favorites_screen(uid, message.chat.id)
 
 @dp.message(F.text == "🍽 Рецепты")
+@serialized_ui
 async def show_categories(message: Message):
     uid = str(message.from_user.id)
     if not await has_access(uid):
         await send_tariff_card(message.chat.id)
         return
     await delete_trigger_message(message)
-    await enter_recipe_mode(uid, message.chat.id)
-    sent = await message.answer(
-        "📂 <b>Выбери категорию:</b>",
-        reply_markup=categories_keyboard(),
-    )
-    await storage.set_menu_message_ids(uid, [sent.message_id])
+    await remove_legacy_reply_keyboard(message.chat.id)
+    await send_categories_screen(uid, message.chat.id)
+
+
+@dp.callback_query(F.data == "nav:recipes")
+@serialized_ui
+async def nav_categories(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    if not await has_access(uid):
+        await callback.answer()
+        await send_tariff_card(callback.message.chat.id)
+        return
+    await delete_callback_origin(callback)
+    await send_categories_screen(uid, callback.message.chat.id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "nav:favorites")
+@serialized_ui
+async def nav_favorites(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    if not await has_access(uid):
+        await callback.answer()
+        await send_tariff_card(callback.message.chat.id)
+        return
+    await delete_callback_origin(callback)
+    await send_favorites_screen(uid, callback.message.chat.id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "nav:mariya")
+@serialized_ui
+async def nav_mariya(callback: CallbackQuery):
+    uid = str(callback.from_user.id)
+    if not await has_access(uid):
+        await callback.answer()
+        await send_tariff_card(callback.message.chat.id)
+        return
+    await delete_callback_origin(callback)
+    await send_mariya_screen(uid, callback.message.chat.id)
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("cat:"))
+@serialized_ui
 async def show_subcategories(callback: CallbackQuery):
     uid = str(callback.from_user.id)
     if not await has_access(uid):
@@ -1413,6 +1535,7 @@ async def show_subcategories(callback: CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("sub:"))
+@serialized_ui
 async def show_recipes(callback: CallbackQuery):
     uid = str(callback.from_user.id)
     if not await has_access(uid):
@@ -1432,6 +1555,7 @@ async def show_recipes(callback: CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("rec:"))
+@serialized_ui
 async def show_recipe(callback: CallbackQuery):
     uid = str(callback.from_user.id)
     if not await has_access(uid):
@@ -1506,6 +1630,7 @@ async def show_recipe(callback: CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("back:"))
+@serialized_ui
 async def handle_back(callback: CallbackQuery):
     uid = str(callback.from_user.id)
     if not await has_access(uid):
@@ -1566,24 +1691,15 @@ async def handle_back(callback: CallbackQuery):
 # ─── МарИИя ───────────────────────────────────────────────────────────────────
 
 @dp.message(F.text == "🤖 Спросить МарИИю")
+@serialized_ui
 async def mariya_intro(message: Message):
     uid = str(message.from_user.id)
     if not await has_access(uid):
         await send_tariff_card(message.chat.id)
         return
     await delete_trigger_message(message)
-    await enter_recipe_mode(uid, message.chat.id)
-    await storage.set_mariya_mode(uid, True)
-    sent = await message.answer(
-        "🤖 <b>МарИИя — AI-нутрициолог</b>\n\n"
-        "Я помогу:\n"
-        "• Посчитать твою норму КБЖУ\n"
-        "• Составить рацион по твоим целям\n"
-        "• Подобрать рецепты под аллергии и предпочтения\n\n"
-        "Просто напиши что тебе нужно 👇\n\n"
-        "<i>Команды: /profile — профиль | /forget — очистить диалог | /reset — полный сброс</i>"
-    )
-    await storage.set_menu_message_ids(uid, [sent.message_id])
+    await remove_legacy_reply_keyboard(message.chat.id)
+    await send_mariya_screen(uid, message.chat.id)
 
 @dp.message(F.text)
 async def handle_text(message: Message):
