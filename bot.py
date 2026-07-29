@@ -622,7 +622,7 @@ async def clear_open_recipe(user_id: str, chat_id: int):
 
 
 async def clear_open_menu(user_id: str, chat_id: int):
-    """Удаляет текущее inline-меню: категории, подкатегории или список рецептов."""
+    """Удаляет текущий экран: inline-меню или вступительную карточку МарИИи."""
     if not storage:
         return
     state = await storage.get_ui_state(user_id)
@@ -633,6 +633,16 @@ async def clear_open_menu(user_id: str, chat_id: int):
             pass
     if state["menu_message_ids"]:
         await storage.set_menu_message_ids(user_id, [])
+
+
+async def delete_trigger_message(message: Message):
+    """Убирает маленькое сообщение от reply-кнопки после его обработки."""
+    try:
+        await bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        # В личном чате бот может удалять входящие сообщения. Если Telegram
+        # временно отказал или сообщение уже удалено, основной сценарий живёт.
+        pass
 
 
 async def enter_recipe_mode(user_id: str, chat_id: int):
@@ -1348,6 +1358,7 @@ async def show_favorites(message: Message):
     if not await has_access(uid):
         await send_tariff_card(message.chat.id)
         return
+    await delete_trigger_message(message)
     await enter_recipe_mode(uid, message.chat.id)
     fav_ids = [r for r in await storage.get_favorites(uid) if r in RECIPES]
     if not fav_ids:
@@ -1376,6 +1387,7 @@ async def show_categories(message: Message):
     if not await has_access(uid):
         await send_tariff_card(message.chat.id)
         return
+    await delete_trigger_message(message)
     await enter_recipe_mode(uid, message.chat.id)
     sent = await message.answer(
         "📂 <b>Выбери категорию:</b>",
@@ -1559,9 +1571,10 @@ async def mariya_intro(message: Message):
     if not await has_access(uid):
         await send_tariff_card(message.chat.id)
         return
+    await delete_trigger_message(message)
     await enter_recipe_mode(uid, message.chat.id)
     await storage.set_mariya_mode(uid, True)
-    await message.answer(
+    sent = await message.answer(
         "🤖 <b>МарИИя — AI-нутрициолог</b>\n\n"
         "Я помогу:\n"
         "• Посчитать твою норму КБЖУ\n"
@@ -1570,6 +1583,7 @@ async def mariya_intro(message: Message):
         "Просто напиши что тебе нужно 👇\n\n"
         "<i>Команды: /profile — профиль | /forget — очистить диалог | /reset — полный сброс</i>"
     )
+    await storage.set_menu_message_ids(uid, [sent.message_id])
 
 @dp.message(F.text)
 async def handle_text(message: Message):
