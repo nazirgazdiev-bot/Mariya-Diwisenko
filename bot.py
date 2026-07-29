@@ -138,21 +138,60 @@ def get_photo_path(recipe_id: str) -> str | None:
 # ─── Форматирование рецепта ───────────────────────────────────────────────────
 
 def format_recipe(recipe: dict) -> str:
-    name = recipe.get("name", "")
-    kcal = recipe.get("kcal", "—")
-    protein = recipe.get("protein", "—")
-    fat = recipe.get("fat", "—")
-    carbs = recipe.get("carbs", "—")
+    def display_number(value) -> str:
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value).replace(".", ",")
+
+    def kbju_line(values: dict) -> str:
+        parts = []
+        if "kcal" in values:
+            parts.append(f"🔥 {display_number(values['kcal'])} ккал")
+        else:
+            parts.append("🔥 калорийность не указана")
+        parts.append(
+            f"🥩 Б: {display_number(values['protein'])}г  |  "
+            f"🧈 Ж: {display_number(values['fat'])}г  |  "
+            f"🍞 У: {display_number(values['carbs'])}г"
+        )
+        return "  |  ".join(parts)
+
+    name = html.escape(recipe.get("name", ""))
     ingredients = recipe.get("ingredients", [])
-    ingredients_text = "\n".join(f"• {ing}" for ing in ingredients)
-    instructions = recipe.get("instructions", "").replace("ПРИГОТОВЛЕНИЕ", "").strip()
+    ingredient_lines = []
+    for ingredient in ingredients:
+        ingredient = html.escape(ingredient)
+        if ingredient.endswith(":"):
+            ingredient_lines.append(f"\n<b>{ingredient}</b>")
+        else:
+            ingredient_lines.append(f"• {ingredient}")
+    ingredients_text = "\n".join(ingredient_lines).lstrip()
+    instructions = (
+        recipe.get("instructions", "")
+        .replace("ПРИГОТОВЛЕНИЕ", "")
+        .strip()
+    )
     if len(instructions) > 2000:
         instructions = instructions[:1997] + "..."
+    instructions = html.escape(instructions)
 
     text = f"<b>🍳 {name}</b>\n\n"
-    text += "📊 <b>КБЖУ на 100г:</b>\n"
-    text += f"🔥 {kcal} ккал  |  🥩 Б: {protein}г  |  🧈 Ж: {fat}г  |  🍞 У: {carbs}г\n\n"
-    text += f"🛒 <b>Ингредиенты:</b>\n{ingredients_text}\n\n"
+    variants = recipe.get("kbju_variants", [])
+    if variants:
+        text += "📊 <b>КБЖУ:</b>\n"
+        for variant in variants:
+            text += f"<b>{html.escape(variant['label'])}:</b>\n"
+            text += f"{kbju_line(variant)}\n"
+        text += "\n"
+    elif all(field in recipe for field in ("protein", "fat", "carbs")):
+        label = html.escape(recipe.get("kbju_label", "На 100 г"))
+        text += f"📊 <b>КБЖУ — {label}:</b>\n"
+        text += f"{kbju_line(recipe)}\n\n"
+    else:
+        text += "📊 <b>КБЖУ в сборнике не указано</b>\n\n"
+
+    if ingredients_text:
+        text += f"🛒 <b>Ингредиенты:</b>\n{ingredients_text}\n\n"
     text += f"👨‍🍳 <b>Приготовление:</b>\n{instructions}"
     return text
 
@@ -554,6 +593,29 @@ dp = Dispatcher()
 storage: Storage = None
 mariya: Mariya = None
 sheets_client: SheetsClient | None = None
+
+
+async def clear_open_recipe(user_id: str, chat_id: int):
+    """Удаляет все сообщения текущей карточки рецепта, включая отдельное фото."""
+    if not storage:
+        return
+    state = await storage.get_ui_state(user_id)
+    for message_id in state["recipe_message_ids"]:
+        try:
+            await bot.delete_message(chat_id, message_id)
+        except Exception:
+            # Сообщение уже могло быть удалено кнопкой «Назад» или самим юзером.
+            pass
+    if state["recipe_message_ids"]:
+        await storage.set_recipe_message_ids(user_id, [])
+
+
+async def enter_recipe_mode(user_id: str, chat_id: int):
+    """Закрывает МарИИю и убирает ранее открытую карточку рецепта."""
+    if not storage:
+        return
+    await storage.set_mariya_mode(user_id, False)
+    await clear_open_recipe(user_id, chat_id)
 
 
 async def _sheets_log_payment(user_id: str, tier: str, amount, commission_sum, status: str, order_id: str):
@@ -994,6 +1056,7 @@ async def cmd_start(message: Message):
     uid = str(message.from_user.id)
     existing_sub = None
     if storage:
+        await enter_recipe_mode(uid, message.chat.id)
         existing_sub = await storage.get_subscription(uid)
         await storage.set_blocked(uid, False)  # написал нам — точно не заблокирован
         name = message.from_user.first_name
@@ -1255,10 +1318,12 @@ async def toggle_favorite(callback: CallbackQuery):
 async def show_favorites(message: Message):
     if not storage:
         return
-    if not await has_access(str(message.from_user.id)):
+    uid = str(message.from_user.id)
+    if not await has_access(uid):
         await send_tariff_card(message.chat.id)
         return
-    fav_ids = [r for r in await storage.get_favorites(str(message.from_user.id)) if r in RECIPES]
+    await enter_recipe_mode(uid, message.chat.id)
+    fav_ids = [r for r in await storage.get_favorites(uid) if r in RECIPES]
     if not fav_ids:
         await message.answer(
             "⭐ <b>Избранное пустое</b>\n\n"
@@ -1279,17 +1344,21 @@ async def show_favorites(message: Message):
 
 @dp.message(F.text == "🍽 Рецепты")
 async def show_categories(message: Message):
-    if not await has_access(str(message.from_user.id)):
+    uid = str(message.from_user.id)
+    if not await has_access(uid):
         await send_tariff_card(message.chat.id)
         return
+    await enter_recipe_mode(uid, message.chat.id)
     await message.answer("📂 <b>Выбери категорию:</b>", reply_markup=categories_keyboard())
 
 @dp.callback_query(F.data.startswith("cat:"))
 async def show_subcategories(callback: CallbackQuery):
-    if not await has_access(str(callback.from_user.id)):
+    uid = str(callback.from_user.id)
+    if not await has_access(uid):
         await callback.answer()
         await send_tariff_card(callback.message.chat.id)
         return
+    await storage.set_mariya_mode(uid, False)
     cat_idx = int(callback.data.split(":")[1])
     cat = CATEGORIES[cat_idx]
     await callback.message.edit_text(
@@ -1300,10 +1369,12 @@ async def show_subcategories(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("sub:"))
 async def show_recipes(callback: CallbackQuery):
-    if not await has_access(str(callback.from_user.id)):
+    uid = str(callback.from_user.id)
+    if not await has_access(uid):
         await callback.answer()
         await send_tariff_card(callback.message.chat.id)
         return
+    await storage.set_mariya_mode(uid, False)
     _, cat_idx, sub_idx = callback.data.split(":")
     cat_idx, sub_idx = int(cat_idx), int(sub_idx)
     cat = CATEGORIES[cat_idx]
@@ -1316,7 +1387,8 @@ async def show_recipes(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("rec:"))
 async def show_recipe(callback: CallbackQuery):
-    if not await has_access(str(callback.from_user.id)):
+    uid = str(callback.from_user.id)
+    if not await has_access(uid):
         await callback.answer()
         await send_tariff_card(callback.message.chat.id)
         return
@@ -1325,9 +1397,10 @@ async def show_recipe(callback: CallbackQuery):
     if not recipe:
         await callback.answer("Рецепт не найден")
         return
+    await enter_recipe_mode(uid, callback.message.chat.id)
     cat_idx, sub_idx = find_cat_sub_for_recipe(recipe)
     text = format_recipe(recipe)
-    is_fav = await storage.is_favorite(str(callback.from_user.id), recipe_id) if storage else False
+    is_fav = await storage.is_favorite(uid, recipe_id) if storage else False
     try:
         await callback.message.delete()
     except Exception:
@@ -1341,37 +1414,47 @@ async def show_recipe(callback: CallbackQuery):
         bool(photo_path and os.path.exists(photo_path)),
     )
     photo_sent_with_caption = False
+    recipe_message_ids = []
     if photo_path:
         try:
             if len(text) <= 1024:
                 # влезает в лимит подписи Telegram — шлём одним сообщением
-                await callback.message.answer_photo(
+                sent = await bot.send_photo(
+                    callback.message.chat.id,
                     FSInputFile(photo_path),
                     caption=text,
                     reply_markup=recipe_keyboard(cat_idx, sub_idx, recipe_id, is_fav),
                 )
+                recipe_message_ids.append(sent.message_id)
                 photo_sent_with_caption = True
             else:
-                await callback.message.answer_photo(
+                sent = await bot.send_photo(
+                    callback.message.chat.id,
                     FSInputFile(photo_path),
                 )
+                recipe_message_ids.append(sent.message_id)
         except Exception:
             # не глотаем молча: фото не ушло — логируем и шлём хотя бы текст
             log.exception("Не удалось отправить фото %s (%s)", recipe_id, photo_path)
 
     if not photo_sent_with_caption:
-        await callback.message.answer(
+        sent = await bot.send_message(
+            callback.message.chat.id,
             text,
             reply_markup=recipe_keyboard(cat_idx, sub_idx, recipe_id, is_fav),
         )
+        recipe_message_ids.append(sent.message_id)
+    await storage.set_recipe_message_ids(uid, recipe_message_ids)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("back:"))
 async def handle_back(callback: CallbackQuery):
-    if not await has_access(str(callback.from_user.id)):
+    uid = str(callback.from_user.id)
+    if not await has_access(uid):
         await callback.answer()
         await send_tariff_card(callback.message.chat.id)
         return
+    await storage.set_mariya_mode(uid, False)
     parts = callback.data.split(":")
     if parts[1] == "main":
         await callback.message.edit_text("📂 <b>Выбери категорию:</b>", reply_markup=categories_keyboard())
@@ -1386,32 +1469,44 @@ async def handle_back(callback: CallbackQuery):
         cat_idx, sub_idx = int(parts[2]), int(parts[3])
         cat = CATEGORIES[cat_idx]
         sub = STRUCTURE[cat][sub_idx]
-        # Рецепт мог быть показан как фото — его нельзя "отредактировать" в
-        # текстовый список, поэтому удаляем старое сообщение и шлём свежий
-        # список (иначе рецепт-фото зависает сверху — жалоба Назира 2026-07-16).
-        try:
-            await callback.message.edit_text(
+        state = await storage.get_ui_state(uid)
+        if callback.message.message_id in state["recipe_message_ids"]:
+            # У длинного рецепта фото и текст идут двумя сообщениями.
+            # Удаляем оба, а не только сообщение с кнопкой «Назад».
+            await clear_open_recipe(uid, callback.message.chat.id)
+            await bot.send_message(
+                callback.message.chat.id,
                 f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
                 reply_markup=recipes_keyboard(cat_idx, sub_idx),
             )
-        except Exception:
+        else:
             try:
-                await callback.message.delete()
+                await callback.message.edit_text(
+                    f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
+                    reply_markup=recipes_keyboard(cat_idx, sub_idx),
+                )
             except Exception:
-                pass
-            await callback.message.answer(
-                f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
-                reply_markup=recipes_keyboard(cat_idx, sub_idx),
-            )
+                try:
+                    await callback.message.delete()
+                except Exception:
+                    pass
+                await bot.send_message(
+                    callback.message.chat.id,
+                    f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
+                    reply_markup=recipes_keyboard(cat_idx, sub_idx),
+                )
     await callback.answer()
 
 # ─── МарИИя ───────────────────────────────────────────────────────────────────
 
 @dp.message(F.text == "🤖 Спросить МарИИю")
 async def mariya_intro(message: Message):
-    if not await has_access(str(message.from_user.id)):
+    uid = str(message.from_user.id)
+    if not await has_access(uid):
         await send_tariff_card(message.chat.id)
         return
+    await clear_open_recipe(uid, message.chat.id)
+    await storage.set_mariya_mode(uid, True)
     await message.answer(
         "🤖 <b>МарИИя — AI-нутрициолог</b>\n\n"
         "Я помогу:\n"
@@ -1430,6 +1525,10 @@ async def handle_text(message: Message):
 
     uid = str(message.from_user.id)
     await storage.set_blocked(uid, False)  # написал нам — точно не заблокирован
+
+    state = await storage.get_ui_state(uid)
+    if not state["mariya_mode"]:
+        return
 
     if not await has_access(uid):
         await send_tariff_card(message.chat.id)

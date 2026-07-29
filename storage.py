@@ -79,6 +79,13 @@ class Storage:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_fav_user ON favorites(user_id, created_at)"
             )
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS ui_state (
+                    user_id TEXT PRIMARY KEY,
+                    recipe_message_ids_json TEXT NOT NULL DEFAULT '[]',
+                    mariya_mode INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT
+                )""")
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_subs_renewal ON subscriptions(renewal_next_at)"
             )
@@ -475,6 +482,78 @@ class Storage:
                 (user_id,),
             ) as cur:
                 return [r[0] for r in await cur.fetchall()]
+
+    # ---------- Состояние интерфейса ----------
+
+    async def get_ui_state(self, user_id: str) -> dict:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """SELECT recipe_message_ids_json, mariya_mode
+                   FROM ui_state WHERE user_id = ?""",
+                (user_id,),
+            ) as cur:
+                row = await cur.fetchone()
+        if not row:
+            return {"recipe_message_ids": [], "mariya_mode": False}
+        try:
+            message_ids = [
+                int(message_id)
+                for message_id in json.loads(row[0] or "[]")
+                if str(message_id).isdigit()
+            ]
+        except (json.JSONDecodeError, TypeError, ValueError):
+            message_ids = []
+        return {
+            "recipe_message_ids": message_ids,
+            "mariya_mode": bool(row[1]),
+        }
+
+    async def set_recipe_message_ids(self, user_id: str, message_ids: list[int]):
+        await self._upsert_ui_state(
+            user_id,
+            recipe_message_ids_json=json.dumps(message_ids),
+        )
+
+    async def set_mariya_mode(self, user_id: str, enabled: bool):
+        await self._upsert_ui_state(user_id, mariya_mode=1 if enabled else 0)
+
+    async def _upsert_ui_state(
+        self,
+        user_id: str,
+        *,
+        recipe_message_ids_json=_UNSET,
+        mariya_mode=_UNSET,
+    ):
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT 1 FROM ui_state WHERE user_id = ?", (user_id,)
+            ) as cur:
+                exists = await cur.fetchone()
+            if exists:
+                fields = {}
+                if recipe_message_ids_json is not _UNSET:
+                    fields["recipe_message_ids_json"] = recipe_message_ids_json
+                if mariya_mode is not _UNSET:
+                    fields["mariya_mode"] = mariya_mode
+                sets = ", ".join(f"{key} = ?" for key in fields)
+                if sets:
+                    await db.execute(
+                        f"UPDATE ui_state SET {sets}, updated_at = ? WHERE user_id = ?",
+                        (*fields.values(), self._now(), user_id),
+                    )
+            else:
+                await db.execute(
+                    """INSERT INTO ui_state
+                       (user_id, recipe_message_ids_json, mariya_mode, updated_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (
+                        user_id,
+                        "[]" if recipe_message_ids_json is _UNSET else recipe_message_ids_json,
+                        0 if mariya_mode is _UNSET else mariya_mode,
+                        self._now(),
+                    ),
+                )
+            await db.commit()
 
     # ---------- Блокировка бота юзером ----------
 
