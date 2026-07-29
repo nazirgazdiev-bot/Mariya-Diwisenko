@@ -406,6 +406,12 @@ def rebuild(pdf_path: Path, menu_path: Path, output_path: Path, report_path: Pat
 
     with pdfplumber.open(pdf_path) as pdf:
         for recipe in menu["recipes"]:
+            menu_paths = recipe.get("menu_paths", [])
+            if menu_paths:
+                category, separator, _ = menu_paths[0].partition("/")
+                if separator:
+                    recipe["category"] = category
+
             page_number = int(recipe["page"])
             page = visible_page(pdf.pages[page_number - 1])
             text = page.extract_text(x_tolerance=2, y_tolerance=3) or ""

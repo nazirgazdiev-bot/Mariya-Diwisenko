@@ -105,7 +105,15 @@ def recipes_keyboard(cat_idx: int, sub_idx: int):
             name = RECIPES[rid]["name"]
             if len(name) > 40:
                 name = name[:37] + "..."
-            buttons.append([InlineKeyboardButton(text=name, callback_data=f"rec:{rid}")])
+            # Передаём раздел, из которого открыт рецепт, чтобы кнопка «Назад»
+            # возвращала именно в текущий список. Это важно для рецептов,
+            # которые одновременно находятся в нескольких подкатегориях.
+            buttons.append([
+                InlineKeyboardButton(
+                    text=name,
+                    callback_data=f"rec:{rid}:{cat_idx}:{sub_idx}",
+                )
+            ])
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"back:cat:{cat_idx}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -196,20 +204,23 @@ def format_recipe(recipe: dict) -> str:
     return text
 
 def find_cat_sub_for_recipe(recipe: dict):
-    cat_idx, sub_idx = 0, 0
-    cat_name = recipe.get("category", "")
+    """Возвращает первый фактический путь рецепта из структуры меню."""
     menu_paths = recipe.get("menu_paths", [])
-    if cat_name in CATEGORIES:
-        cat_idx = CATEGORIES.index(cat_name)
     if menu_paths:
-        parts = menu_paths[0].split("/")
-        if len(parts) > 1:
-            sub_name = parts[1]
-            cat = CATEGORIES[cat_idx]
-            subcats = STRUCTURE.get(cat, [])
+        cat_name, separator, sub_name = menu_paths[0].partition("/")
+        if separator and cat_name in CATEGORIES:
+            cat_idx = CATEGORIES.index(cat_name)
+            subcats = STRUCTURE.get(cat_name, [])
             if sub_name in subcats:
-                sub_idx = subcats.index(sub_name)
-    return cat_idx, sub_idx
+                return cat_idx, subcats.index(sub_name)
+
+    # Фолбэк для старых/неполных записей: ищем рецепт непосредственно в MENU.
+    recipe_id = recipe.get("id")
+    for cat_idx, cat_name in enumerate(CATEGORIES):
+        for sub_idx, sub_name in enumerate(STRUCTURE.get(cat_name, [])):
+            if recipe_id in MENU.get(cat_name, {}).get(sub_name, []):
+                return cat_idx, sub_idx
+    return 0, 0
 
 # ─── Воронка продаж: тексты, тарифы, клавиатуры ──────────────────────────────
 
@@ -1392,13 +1403,25 @@ async def show_recipe(callback: CallbackQuery):
         await callback.answer()
         await send_tariff_card(callback.message.chat.id)
         return
-    recipe_id = callback.data[4:]
+    parts = callback.data.split(":")
+    recipe_id = parts[1]
     recipe = RECIPES.get(recipe_id)
     if not recipe:
         await callback.answer("Рецепт не найден")
         return
     await enter_recipe_mode(uid, callback.message.chat.id)
     cat_idx, sub_idx = find_cat_sub_for_recipe(recipe)
+    if len(parts) == 4:
+        try:
+            origin_cat_idx, origin_sub_idx = int(parts[2]), int(parts[3])
+            origin_cat = CATEGORIES[origin_cat_idx]
+            origin_sub = STRUCTURE[origin_cat][origin_sub_idx]
+            if recipe_id in MENU[origin_cat][origin_sub]:
+                cat_idx, sub_idx = origin_cat_idx, origin_sub_idx
+        except (ValueError, IndexError, KeyError):
+            # Повреждённый callback не должен ломать открытие рецепта:
+            # используем проверенный первый путь из menu_paths/MENU.
+            pass
     text = format_recipe(recipe)
     is_fav = await storage.is_favorite(uid, recipe_id) if storage else False
     try:
