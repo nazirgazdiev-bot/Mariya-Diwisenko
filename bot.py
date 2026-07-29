@@ -621,12 +621,27 @@ async def clear_open_recipe(user_id: str, chat_id: int):
         await storage.set_recipe_message_ids(user_id, [])
 
 
+async def clear_open_menu(user_id: str, chat_id: int):
+    """Удаляет текущее inline-меню: категории, подкатегории или список рецептов."""
+    if not storage:
+        return
+    state = await storage.get_ui_state(user_id)
+    for message_id in state["menu_message_ids"]:
+        try:
+            await bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+    if state["menu_message_ids"]:
+        await storage.set_menu_message_ids(user_id, [])
+
+
 async def enter_recipe_mode(user_id: str, chat_id: int):
-    """Закрывает МарИИю и убирает ранее открытую карточку рецепта."""
+    """Закрывает МарИИю и убирает предыдущую карточку или inline-меню."""
     if not storage:
         return
     await storage.set_mariya_mode(user_id, False)
     await clear_open_recipe(user_id, chat_id)
+    await clear_open_menu(user_id, chat_id)
 
 
 async def _sheets_log_payment(user_id: str, tier: str, amount, commission_sum, status: str, order_id: str):
@@ -1336,11 +1351,12 @@ async def show_favorites(message: Message):
     await enter_recipe_mode(uid, message.chat.id)
     fav_ids = [r for r in await storage.get_favorites(uid) if r in RECIPES]
     if not fav_ids:
-        await message.answer(
+        sent = await message.answer(
             "⭐ <b>Избранное пустое</b>\n\n"
             "Открой любой рецепт и нажми «⭐ В избранное» — он появится здесь, "
             "чтобы был всегда под рукой."
         )
+        await storage.set_menu_message_ids(uid, [sent.message_id])
         return
     buttons = []
     for rid in fav_ids:
@@ -1348,10 +1364,11 @@ async def show_favorites(message: Message):
         if len(name) > 40:
             name = name[:37] + "..."
         buttons.append([InlineKeyboardButton(text=name, callback_data=f"rec:{rid}")])
-    await message.answer(
+    sent = await message.answer(
         "⭐ <b>Твоё избранное:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
+    await storage.set_menu_message_ids(uid, [sent.message_id])
 
 @dp.message(F.text == "🍽 Рецепты")
 async def show_categories(message: Message):
@@ -1360,7 +1377,11 @@ async def show_categories(message: Message):
         await send_tariff_card(message.chat.id)
         return
     await enter_recipe_mode(uid, message.chat.id)
-    await message.answer("📂 <b>Выбери категорию:</b>", reply_markup=categories_keyboard())
+    sent = await message.answer(
+        "📂 <b>Выбери категорию:</b>",
+        reply_markup=categories_keyboard(),
+    )
+    await storage.set_menu_message_ids(uid, [sent.message_id])
 
 @dp.callback_query(F.data.startswith("cat:"))
 async def show_subcategories(callback: CallbackQuery):
@@ -1376,6 +1397,7 @@ async def show_subcategories(callback: CallbackQuery):
         f"📁 <b>{cat}</b>\n\nВыбери подкатегорию:",
         reply_markup=subcategories_keyboard(cat_idx),
     )
+    await storage.set_menu_message_ids(uid, [callback.message.message_id])
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("sub:"))
@@ -1394,6 +1416,7 @@ async def show_recipes(callback: CallbackQuery):
         f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
         reply_markup=recipes_keyboard(cat_idx, sub_idx),
     )
+    await storage.set_menu_message_ids(uid, [callback.message.message_id])
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("rec:"))
@@ -1479,8 +1502,10 @@ async def handle_back(callback: CallbackQuery):
         return
     await storage.set_mariya_mode(uid, False)
     parts = callback.data.split(":")
+    menu_message_id = None
     if parts[1] == "main":
         await callback.message.edit_text("📂 <b>Выбери категорию:</b>", reply_markup=categories_keyboard())
+        menu_message_id = callback.message.message_id
     elif parts[1] == "cat":
         cat_idx = int(parts[2])
         cat = CATEGORIES[cat_idx]
@@ -1488,6 +1513,7 @@ async def handle_back(callback: CallbackQuery):
             f"📁 <b>{cat}</b>\n\nВыбери подкатегорию:",
             reply_markup=subcategories_keyboard(cat_idx),
         )
+        menu_message_id = callback.message.message_id
     elif parts[1] == "sub":
         cat_idx, sub_idx = int(parts[2]), int(parts[3])
         cat = CATEGORIES[cat_idx]
@@ -1497,27 +1523,32 @@ async def handle_back(callback: CallbackQuery):
             # У длинного рецепта фото и текст идут двумя сообщениями.
             # Удаляем оба, а не только сообщение с кнопкой «Назад».
             await clear_open_recipe(uid, callback.message.chat.id)
-            await bot.send_message(
+            sent = await bot.send_message(
                 callback.message.chat.id,
                 f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
                 reply_markup=recipes_keyboard(cat_idx, sub_idx),
             )
+            menu_message_id = sent.message_id
         else:
             try:
                 await callback.message.edit_text(
                     f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
                     reply_markup=recipes_keyboard(cat_idx, sub_idx),
                 )
+                menu_message_id = callback.message.message_id
             except Exception:
                 try:
                     await callback.message.delete()
                 except Exception:
                     pass
-                await bot.send_message(
+                sent = await bot.send_message(
                     callback.message.chat.id,
                     f"📋 <b>{sub}</b>\n\nВыбери рецепт:",
                     reply_markup=recipes_keyboard(cat_idx, sub_idx),
                 )
+                menu_message_id = sent.message_id
+    if menu_message_id is not None:
+        await storage.set_menu_message_ids(uid, [menu_message_id])
     await callback.answer()
 
 # ─── МарИИя ───────────────────────────────────────────────────────────────────
@@ -1528,7 +1559,7 @@ async def mariya_intro(message: Message):
     if not await has_access(uid):
         await send_tariff_card(message.chat.id)
         return
-    await clear_open_recipe(uid, message.chat.id)
+    await enter_recipe_mode(uid, message.chat.id)
     await storage.set_mariya_mode(uid, True)
     await message.answer(
         "🤖 <b>МарИИя — AI-нутрициолог</b>\n\n"

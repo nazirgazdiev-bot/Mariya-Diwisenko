@@ -83,6 +83,7 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS ui_state (
                     user_id TEXT PRIMARY KEY,
                     recipe_message_ids_json TEXT NOT NULL DEFAULT '[]',
+                    menu_message_ids_json TEXT NOT NULL DEFAULT '[]',
                     mariya_mode INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT
                 )""")
@@ -105,6 +106,16 @@ class Storage:
             if "blocked" not in existing_cols:
                 await db.execute(
                     "ALTER TABLE subscriptions ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0"
+                )
+
+            # Сообщения inline-меню начали сохранять позднее карточек рецептов.
+            # Добавляем поле без потери уже накопленного состояния пользователей.
+            async with db.execute("PRAGMA table_info(ui_state)") as cur:
+                ui_state_cols = {row[1] for row in await cur.fetchall()}
+            if "menu_message_ids_json" not in ui_state_cols:
+                await db.execute(
+                    "ALTER TABLE ui_state ADD COLUMN "
+                    "menu_message_ids_json TEXT NOT NULL DEFAULT '[]'"
                 )
 
             # Профиль Telegram нужен для выгрузки базы пользователей и сегментов.
@@ -488,30 +499,49 @@ class Storage:
     async def get_ui_state(self, user_id: str) -> dict:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
-                """SELECT recipe_message_ids_json, mariya_mode
+                """SELECT recipe_message_ids_json, menu_message_ids_json, mariya_mode
                    FROM ui_state WHERE user_id = ?""",
                 (user_id,),
             ) as cur:
                 row = await cur.fetchone()
         if not row:
-            return {"recipe_message_ids": [], "mariya_mode": False}
+            return {
+                "recipe_message_ids": [],
+                "menu_message_ids": [],
+                "mariya_mode": False,
+            }
         try:
-            message_ids = [
+            recipe_message_ids = [
                 int(message_id)
                 for message_id in json.loads(row[0] or "[]")
                 if str(message_id).isdigit()
             ]
         except (json.JSONDecodeError, TypeError, ValueError):
-            message_ids = []
+            recipe_message_ids = []
+        try:
+            menu_message_ids = [
+                int(message_id)
+                for message_id in json.loads(row[1] or "[]")
+                if str(message_id).isdigit()
+            ]
+        except (json.JSONDecodeError, TypeError, ValueError):
+            menu_message_ids = []
         return {
-            "recipe_message_ids": message_ids,
-            "mariya_mode": bool(row[1]),
+            "recipe_message_ids": recipe_message_ids,
+            "menu_message_ids": menu_message_ids,
+            "mariya_mode": bool(row[2]),
         }
 
     async def set_recipe_message_ids(self, user_id: str, message_ids: list[int]):
         await self._upsert_ui_state(
             user_id,
             recipe_message_ids_json=json.dumps(message_ids),
+        )
+
+    async def set_menu_message_ids(self, user_id: str, message_ids: list[int]):
+        await self._upsert_ui_state(
+            user_id,
+            menu_message_ids_json=json.dumps(message_ids),
         )
 
     async def set_mariya_mode(self, user_id: str, enabled: bool):
@@ -522,6 +552,7 @@ class Storage:
         user_id: str,
         *,
         recipe_message_ids_json=_UNSET,
+        menu_message_ids_json=_UNSET,
         mariya_mode=_UNSET,
     ):
         async with aiosqlite.connect(self.db_path) as db:
@@ -533,6 +564,8 @@ class Storage:
                 fields = {}
                 if recipe_message_ids_json is not _UNSET:
                     fields["recipe_message_ids_json"] = recipe_message_ids_json
+                if menu_message_ids_json is not _UNSET:
+                    fields["menu_message_ids_json"] = menu_message_ids_json
                 if mariya_mode is not _UNSET:
                     fields["mariya_mode"] = mariya_mode
                 sets = ", ".join(f"{key} = ?" for key in fields)
@@ -544,11 +577,13 @@ class Storage:
             else:
                 await db.execute(
                     """INSERT INTO ui_state
-                       (user_id, recipe_message_ids_json, mariya_mode, updated_at)
-                       VALUES (?, ?, ?, ?)""",
+                       (user_id, recipe_message_ids_json, menu_message_ids_json,
+                        mariya_mode, updated_at)
+                       VALUES (?, ?, ?, ?, ?)""",
                     (
                         user_id,
                         "[]" if recipe_message_ids_json is _UNSET else recipe_message_ids_json,
+                        "[]" if menu_message_ids_json is _UNSET else menu_message_ids_json,
                         0 if mariya_mode is _UNSET else mariya_mode,
                         self._now(),
                     ),
