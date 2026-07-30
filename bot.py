@@ -854,6 +854,9 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
                 chat_id,
                 FSInputFile(step1_video),
                 caption=STEP1_VIDEO_TEXT,
+                width=576,
+                height=1280,
+                duration=61,
                 supports_streaming=True,
                 reply_markup=step1_keyboard,
             )
