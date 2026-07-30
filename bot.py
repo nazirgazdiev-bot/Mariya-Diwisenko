@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from mariya import Mariya
 from prodamus import ProdamusClient
 from sheets import SheetsClient
-from storage import Storage
+from storage import SOURCE_TAGS, Storage
 
 load_dotenv()
 
@@ -682,8 +682,11 @@ async def _sheets_log_payment(user_id: str, tier: str, amount, commission_sum, s
         return
     loop = asyncio.get_running_loop()
     try:
+        client = await storage.get_client(user_id) if storage else {}
+        source_tag = client.get("source_tag") or "direct"
         await loop.run_in_executor(
-            None, sheets_client.log_payment, user_id, tier, amount, commission_sum, status, order_id
+            None, sheets_client.log_payment, user_id, tier, amount,
+            commission_sum, status, order_id, source_tag,
         )
     except Exception:
         log.exception("Не удалось записать платёж в Google Sheets user_id=%s order_id=%s", user_id, order_id)
@@ -1113,6 +1116,11 @@ async def sheets_sync_worker():
 @serialized_ui
 async def cmd_start(message: Message):
     uid = str(message.from_user.id)
+    start_payload = ""
+    if message.text:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) == 2:
+            start_payload = parts[1].strip().lower()
     existing_sub = None
     if storage:
         await enter_recipe_mode(uid, message.chat.id)
@@ -1126,8 +1134,15 @@ async def cmd_start(message: Message):
             client.get("profile", {}),
             username=message.from_user.username,
         )
+        source_tag = None
+        if start_payload in SOURCE_TAGS:
+            source_tag = await storage.set_source_if_untracked(uid, start_payload)
         if existing_sub is None:
-            await storage.add_event(uid, "bot_started")
+            await storage.add_event(
+                uid,
+                "bot_started",
+                {"source_tag": source_tag or "direct"},
+            )
 
     if not storage:
         await send_welcome(message.chat.id)

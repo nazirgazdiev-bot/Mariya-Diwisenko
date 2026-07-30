@@ -13,6 +13,7 @@ from pathlib import Path
 import aiosqlite
 
 _UNSET = object()  # отличаем "не передали" от явного None в upsert_subscription
+SOURCE_TAGS = ("inst", "youtube", "tg_bot", "tg_channel", "tg_students")
 
 
 class Storage:
@@ -123,6 +124,10 @@ class Storage:
                 client_cols = {row[1] for row in await cur.fetchall()}
             if "username" not in client_cols:
                 await db.execute("ALTER TABLE clients ADD COLUMN username TEXT")
+            if "source_tag" not in client_cols:
+                await db.execute("ALTER TABLE clients ADD COLUMN source_tag TEXT")
+            if "source_set_at" not in client_cols:
+                await db.execute("ALTER TABLE clients ADD COLUMN source_set_at TEXT")
 
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS payments (
@@ -178,7 +183,8 @@ class Storage:
         """Возвращает профиль клиента + факты. Если клиента нет — пустой шаблон."""
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
-                "SELECT name, username, profile_json FROM clients WHERE user_id = ?",
+                """SELECT name, username, profile_json, source_tag, source_set_at
+                   FROM clients WHERE user_id = ?""",
                 (user_id,),
             ) as cur:
                 row = await cur.fetchone()
@@ -192,17 +198,19 @@ class Storage:
         if not row:
             return {
                 "user_id": user_id, "name": None, "username": None,
-                "profile": {}, "facts": facts,
+                "profile": {}, "facts": facts, "source_tag": None,
+                "source_set_at": None,
             }
 
-        name, username, profile_json = row
+        name, username, profile_json, source_tag, source_set_at = row
         try:
             profile = json.loads(profile_json) if profile_json else {}
         except json.JSONDecodeError:
             profile = {}
         return {
             "user_id": user_id, "name": name, "username": username,
-            "profile": profile, "facts": facts,
+            "profile": profile, "facts": facts, "source_tag": source_tag,
+            "source_set_at": source_set_at,
         }
 
     async def upsert_client(
@@ -242,6 +250,31 @@ class Storage:
                     ),
                 )
             await db.commit()
+
+    async def set_source_if_untracked(self, user_id: str, source_tag: str) -> str | None:
+        """Закрепляет первый известный рекламный источник за пользователем.
+
+        У старого пользователя без метки источник можно заполнить один раз.
+        Уже записанный рекламный тег последующие ссылки не перезаписывают.
+        """
+        if source_tag not in SOURCE_TAGS:
+            return None
+        now = self._now()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """UPDATE clients
+                   SET source_tag = ?, source_set_at = ?, updated_at = ?
+                   WHERE user_id = ?
+                     AND (source_tag IS NULL OR source_tag = '' OR source_tag = 'direct')""",
+                (source_tag, now, now, user_id),
+            )
+            await db.commit()
+            async with db.execute(
+                "SELECT source_tag FROM clients WHERE user_id = ?",
+                (user_id,),
+            ) as cur:
+                row = await cur.fetchone()
+        return row[0] if row else None
 
     # ---------- Диалог ----------
 
@@ -750,6 +783,7 @@ class Storage:
                     s.user_id,
                     COALESCE(c.name, ''),
                     COALESCE(c.username, ''),
+                    COALESCE(NULLIF(c.source_tag, ''), 'direct'),
                     s.created_at,
                     s.status,
                     COALESCE(s.tier, ''),
@@ -771,7 +805,7 @@ class Storage:
             users = []
             for row in rows:
                 (
-                    user_id, name, username, registered_at, status, tier,
+                    user_id, name, username, source_tag, registered_at, status, tier,
                     paid_until, blocked, payment_count, first_paid_at,
                     last_paid_at, revenue, commission,
                 ) = row
@@ -788,6 +822,7 @@ class Storage:
                     "user_id": user_id,
                     "name": name,
                     "username": username,
+                    "source_tag": source_tag,
                     "status": status,
                     "segment": segment,
                     "tier": tier,
@@ -870,6 +905,65 @@ class Storage:
             """) as cur:
                 payment_links = dict(await cur.fetchall())
 
+            source_stats = {
+                tag: {
+                    "source_tag": tag,
+                    "registrations": 0,
+                    "buyers": 0,
+                    "payments": 0,
+                    "revenue": 0,
+                    "commission": 0,
+                }
+                for tag in (*SOURCE_TAGS, "direct")
+            }
+            async with db.execute("""
+                SELECT
+                    COALESCE(NULLIF(c.source_tag, ''), 'direct') AS source_tag,
+                    COUNT(DISTINCT s.user_id)
+                FROM subscriptions s
+                LEFT JOIN clients c ON c.user_id = s.user_id
+                GROUP BY source_tag
+            """) as cur:
+                for source_tag, registrations_count in await cur.fetchall():
+                    source_stats.setdefault(source_tag, {
+                        "source_tag": source_tag,
+                        "registrations": 0,
+                        "buyers": 0,
+                        "payments": 0,
+                        "revenue": 0,
+                        "commission": 0,
+                    })
+                    source_stats[source_tag]["registrations"] = registrations_count
+
+            async with db.execute("""
+                SELECT
+                    COALESCE(NULLIF(c.source_tag, ''), 'direct') AS source_tag,
+                    COUNT(DISTINCT p.user_id),
+                    COUNT(p.id),
+                    COALESCE(SUM(p.amount), 0),
+                    COALESCE(SUM(p.commission_sum), 0)
+                FROM payments p
+                LEFT JOIN clients c ON c.user_id = p.user_id
+                WHERE p.status = 'success'
+                GROUP BY source_tag
+            """) as cur:
+                for source_tag, buyers, payments, revenue, commission in await cur.fetchall():
+                    source_stats.setdefault(source_tag, {
+                        "source_tag": source_tag,
+                        "registrations": 0,
+                        "buyers": 0,
+                        "payments": 0,
+                        "revenue": 0,
+                        "commission": 0,
+                    })
+                    source_stats[source_tag].update({
+                        "buyers": buyers,
+                        "payments": payments,
+                        "revenue": revenue or 0,
+                        "commission": commission or 0,
+                    })
+
+
         dates = sorted(
             set(registrations) | set(payments_by_day)
             | set(tariff_opens) | set(payment_links),
@@ -895,7 +989,15 @@ class Storage:
                 "net": p.get("revenue", 0) - p.get("commission", 0),
                 "conversion": buyers / registrations_count if registrations_count else 0,
             })
-        return {"users": users, "daily": daily}
+        sources = []
+        for source_tag, row in source_stats.items():
+            registrations_count = row["registrations"]
+            row["net"] = row["revenue"] - row["commission"]
+            row["conversion"] = (
+                row["buyers"] / registrations_count if registrations_count else 0
+            )
+            sources.append(row)
+        return {"users": users, "daily": daily, "sources": sources}
 
     # ---------- Метрики для дашборда Google Sheets ----------
 

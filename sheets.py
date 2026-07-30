@@ -16,10 +16,11 @@ DASHBOARD_SHEET = "Дашборд"
 USERS_SHEET = "Пользователи"
 DAILY_SHEET = "Сводка по датам"
 SEGMENTS_SHEET = "Сегменты и рассылки"
+SOURCES_SHEET = "По источникам"
 
 PAYMENTS_HEADER = [
     "Дата", "user_id", "Тариф", "Сумма", "Комиссия Продамуса",
-    "Чистыми", "Статус", "order_id",
+    "Чистыми", "Статус", "order_id", "Источник",
 ]
 
 
@@ -55,26 +56,29 @@ class SheetsClient:
             ws.append_row(PAYMENTS_HEADER, value_input_option="USER_ENTERED")
         else:
             ws = self.sh.worksheet(PAYMENTS_SHEET)
+            if ws.col_count < len(PAYMENTS_HEADER):
+                ws.resize(cols=len(PAYMENTS_HEADER))
             if ws.row_values(1) != PAYMENTS_HEADER:
                 ws.update([PAYMENTS_HEADER], "A1")
 
         for title, rows, cols in (
             (DASHBOARD_SHEET, 50, 4),
-            (USERS_SHEET, 1000, 15),
+            (USERS_SHEET, 1000, 16),
             (DAILY_SHEET, 1000, 12),
             (SEGMENTS_SHEET, 30, 4),
+            (SOURCES_SHEET, 100, 8),
         ):
             if title not in titles:
                 self.sh.add_worksheet(title=title, rows=rows, cols=cols)
 
         ws = self.sh.worksheet(PAYMENTS_SHEET)
         ws.freeze(rows=1)
-        ws.format("A1:H1", self._header_format())
+        ws.format("A1:I1", self._header_format())
         ws.format(
             "D2:F1000",
             {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}},
         )
-        ws.set_basic_filter("A1:H1000")
+        ws.set_basic_filter("A1:I1000")
 
     def log_payment(
         self,
@@ -84,6 +88,7 @@ class SheetsClient:
         commission_sum: float,
         status: str,
         order_id: str,
+        source_tag: str,
     ):
         ws = self.sh.worksheet(PAYMENTS_SHEET)
         amount = amount or 0
@@ -98,6 +103,7 @@ class SheetsClient:
                 round(amount - commission_sum, 2),
                 status,
                 order_id or "",
+                source_tag or "direct",
             ],
             value_input_option="USER_ENTERED",
         )
@@ -108,6 +114,7 @@ class SheetsClient:
         today = now.date().isoformat()
         month = today[:7]
         daily = snapshot.get("daily", [])
+        sources = snapshot.get("sources", [])
 
         def total(field: str, prefix: str | None = None):
             return sum(
@@ -137,18 +144,28 @@ class SheetsClient:
             ["Комиссия Prodamus", total("commission", today), total("commission", month), total("commission")],
             ["Чистыми", total("net", today), total("net", month), total("net")],
             ["", "", "", ""],
+            ["ИСТОЧНИКИ", "Регистрации", "Покупатели", "Оплаты"],
+        ]
+        for row in sources:
+            dashboard_rows.append([
+                row["source_tag"], row["registrations"],
+                row["buyers"], row["payments"],
+            ])
+        dashboard_rows.extend([
+            ["", "", "", ""],
             [
                 "Где смотреть детали",
                 "Сводка по датам",
                 "Пользователи",
-                "Сегменты и рассылки",
+                "По источникам",
             ],
-        ]
+        ])
         ws = self.sh.worksheet(DASHBOARD_SHEET)
         ws.clear()
         ws.update(dashboard_rows, "A1", value_input_option="USER_ENTERED")
         ws.freeze(rows=2)
-        for row in (1, 4, 11, 16):
+        source_header_row = 21
+        for row in (1, 4, 11, 16, source_header_row):
             ws.format(f"A{row}:D{row}", self._header_format())
         ws.format(
             "B17:D19",
@@ -192,7 +209,7 @@ class SheetsClient:
 
         users_header = [
             "Дата входа", "Telegram user_id", "Имя", "Username", "Статус",
-            "Сегмент", "Тариф", "Доступ до", "Количество оплат",
+            "Источник", "Сегмент", "Тариф", "Доступ до", "Количество оплат",
             "Первая оплата", "Последняя оплата", "Выручка", "Комиссия",
             "Чистыми", "Заблокировал бота",
         ]
@@ -200,7 +217,7 @@ class SheetsClient:
             [
                 u["registered_at"], u["user_id"], u["name"],
                 f"@{u['username']}" if u["username"] else "",
-                u["status"], u["segment"], u["tier"], u["paid_until"],
+                u["status"], u["source_tag"], u["segment"], u["tier"], u["paid_until"],
                 u["payment_count"], u["first_paid_at"], u["last_paid_at"],
                 u["revenue"], u["commission"], u["net"],
                 "Да" if u["blocked"] else "Нет",
@@ -209,19 +226,51 @@ class SheetsClient:
         ]
         ws = self.sh.worksheet(USERS_SHEET)
         ws.clear()
-        ws.resize(rows=max(1000, len(users_rows) + 1), cols=15)
+        ws.resize(rows=max(1000, len(users_rows) + 1), cols=16)
         ws.update(
             [users_header] + users_rows,
             "A1",
             value_input_option="USER_ENTERED",
         )
         ws.freeze(rows=1, cols=2)
-        ws.format("A1:O1", self._header_format())
+        ws.format("A1:P1", self._header_format())
         ws.format(
-            "L2:N1000",
+            "M2:O1000",
             {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}},
         )
-        ws.set_basic_filter("A1:O1000")
+        ws.set_basic_filter("A1:P1000")
+
+        sources_header = [
+            "Источник", "Регистрации", "Уникальные покупатели", "Количество оплат",
+            "Выручка", "Комиссия", "Чистыми", "Конверсия в покупателя",
+        ]
+        sources_rows = [
+            [
+                row["source_tag"], row["registrations"], row["buyers"],
+                row["payments"], row["revenue"], row["commission"],
+                row["net"], row["conversion"],
+            ]
+            for row in sources
+        ]
+        ws = self.sh.worksheet(SOURCES_SHEET)
+        ws.clear()
+        ws.resize(rows=max(100, len(sources_rows) + 1), cols=8)
+        ws.update(
+            [sources_header] + sources_rows,
+            "A1",
+            value_input_option="USER_ENTERED",
+        )
+        ws.freeze(rows=1)
+        ws.format("A1:H1", self._header_format())
+        ws.format(
+            "E2:G100",
+            {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}},
+        )
+        ws.format(
+            "H2:H100",
+            {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}},
+        )
+        ws.set_basic_filter("A1:H100")
 
         segments_rows = [
             ["Сегмент", "Кто входит", "Код", "Пример команды"],
