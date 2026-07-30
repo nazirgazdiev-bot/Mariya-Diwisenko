@@ -847,10 +847,22 @@ async def send_funnel_step(chat_id: int, step: int) -> tuple[int | None, float |
     дальше — гибридная схема с абсолютными день-N-в-HH:MM МСК таймкодами
     (см. seconds_until_msk)."""
     if step == 1:
-        await bot.send_message(
-            chat_id, STEP1_VIDEO_TEXT,
-            reply_markup=intro_cta_keyboard("Перейти к оплате бота"),
-        )
+        step1_video = os.path.join(PHOTOS_DIR, "step1_video.mp4")
+        step1_keyboard = intro_cta_keyboard("Перейти к оплате бота")
+        if os.path.exists(step1_video):
+            await bot.send_video(
+                chat_id,
+                FSInputFile(step1_video),
+                caption=STEP1_VIDEO_TEXT,
+                supports_streaming=True,
+                reply_markup=step1_keyboard,
+            )
+        else:
+            await bot.send_message(
+                chat_id,
+                STEP1_VIDEO_TEXT,
+                reply_markup=step1_keyboard,
+            )
         return 2, 15  # тариф-карта — ЧЕРЕЗ 15 СЕКУНД
     if step == 2:
         await send_tariff_card(chat_id)
