@@ -1204,12 +1204,23 @@ async def cmd_start(message: Message):
         )
     else:
         # Новый юзер ИЛИ есть запись, но не оплачено — (пере)запускаем воронку
-        # с самого начала: приветствие → (через 5 сек) видео-шаг → (через
-        # 15 сек) карточка "Что ты получишь". НЕ показываем тарифы сразу —
+        # с самого начала: приветствие → сразу видео-шаг → (через 15 сек)
+        # карточка "Что ты получишь". НЕ показываем тарифы сразу —
         # они идут только по кнопке / в свой черёд по воронке.
-        await storage.upsert_subscription(uid, status="trial", funnel_step=0)
+        await storage.upsert_subscription(
+            uid,
+            status="trial",
+            funnel_step=0,
+            funnel_next_at=None,
+        )
         await send_welcome(message.chat.id)
-        await storage.set_funnel_step(uid, 1, iso_in(5))
+        next_step, delay = await send_funnel_step(message.chat.id, 1)
+        _diag["last_funnel_step_sent"] = 1
+        await storage.set_funnel_step(
+            uid,
+            next_step,
+            iso_in(delay) if delay else None,
+        )
 
 @dp.message(Command("profile"))
 async def cmd_profile(message: Message):
