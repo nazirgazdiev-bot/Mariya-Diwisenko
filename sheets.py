@@ -108,13 +108,47 @@ class SheetsClient:
             value_input_option="USER_ENTERED",
         )
 
-    def write_dashboard_snapshot(self, metrics: dict, snapshot: dict):
+    def read_dashboard_period(self) -> tuple[str, str]:
+        """Возвращает выбранные пользователем даты из строки 2 дашборда."""
+        ws = self.sh.worksheet(DASHBOARD_SHEET)
+        values = ws.get("B2:D2")
+        row = values[0] if values else []
+        start_date = row[0] if len(row) > 0 else ""
+        end_date = row[2] if len(row) > 2 else ""
+        return str(start_date).strip(), str(end_date).strip()
+
+    def _set_dashboard_widths(self, ws):
+        """Фиксированные ширины не дают подписям обрезаться на дашборде."""
+        widths = (250, 170, 170, 170)
+        requests = []
+        for index, width in enumerate(widths):
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": index,
+                        "endIndex": index + 1,
+                    },
+                    "properties": {"pixelSize": width},
+                    "fields": "pixelSize",
+                }
+            })
+        self.sh.batch_update({"requests": requests})
+
+    def write_dashboard_snapshot(
+        self,
+        metrics: dict,
+        snapshot: dict,
+        start_date: str,
+        end_date: str,
+        period_sources: list[dict],
+    ):
         """Записывает готовые числа: никаких формул, зависящих от локали Sheets."""
         now = datetime.now(timezone.utc)
         today = now.date().isoformat()
-        month = today[:7]
         daily = snapshot.get("daily", [])
-        sources = snapshot.get("sources", [])
+        all_sources = snapshot.get("sources", [])
 
         def total(field: str, prefix: str | None = None):
             return sum(
@@ -123,11 +157,24 @@ class SheetsClient:
                 if prefix is None or row.get("date", "").startswith(prefix)
             )
 
+        def period_total(field: str):
+            return sum(
+                row.get(field, 0) or 0
+                for row in daily
+                if start_date <= row.get("date", "") <= end_date
+            )
+
         dashboard_rows = [
             ["МЕТРИКИ TELEGRAM-БОТА", "", "", ""],
-            ["Обновлено (UTC)", now.isoformat(timespec="seconds"), "", ""],
+            ["Дата с", start_date, "Дата по", end_date],
+            [
+                "Обновлено (UTC)",
+                now.isoformat(timespec="seconds"),
+                "Выбранный период",
+                f"{start_date} — {end_date}",
+            ],
             ["", "", "", ""],
-            ["АУДИТОРИЯ СЕЙЧАС", "", "", ""],
+            ["АУДИТОРИЯ ЗА ПЕРИОД", "", "", ""],
             ["Всего зашло в бота", metrics.get("total_registered", 0), "", ""],
             ["Активные подписчики", metrics.get("active", 0), "", ""],
             ["Зашли и не оплатили", metrics.get("trial", 0), "", ""],
@@ -139,14 +186,14 @@ class SheetsClient:
             ["Оплатили и продлили", metrics.get("renewed", 0), "", ""],
             ["Оплатили и не продлили", metrics.get("not_renewed", 0), "", ""],
             ["", "", "", ""],
-            ["ФИНАНСЫ", "Сегодня", "Текущий месяц", "Всё время"],
-            ["Выручка", total("revenue", today), total("revenue", month), total("revenue")],
-            ["Комиссия Prodamus", total("commission", today), total("commission", month), total("commission")],
-            ["Чистыми", total("net", today), total("net", month), total("net")],
+            ["ФИНАНСЫ", "Выбранный период", "Сегодня", "Всё время"],
+            ["Выручка", period_total("revenue"), total("revenue", today), total("revenue")],
+            ["Комиссия Prodamus", period_total("commission"), total("commission", today), total("commission")],
+            ["Чистыми", period_total("net"), total("net", today), total("net")],
             ["", "", "", ""],
             ["ИСТОЧНИКИ", "Регистрации", "Покупатели", "Оплаты"],
         ]
-        for row in sources:
+        for row in period_sources:
             dashboard_rows.append([
                 row["source_tag"], row["registrations"],
                 row["buyers"], row["payments"],
@@ -163,14 +210,26 @@ class SheetsClient:
         ws = self.sh.worksheet(DASHBOARD_SHEET)
         ws.clear()
         ws.update(dashboard_rows, "A1", value_input_option="USER_ENTERED")
-        ws.freeze(rows=2)
-        source_header_row = 21
-        for row in (1, 4, 11, 16, source_header_row):
+        ws.freeze(rows=3)
+        source_header_row = 22
+        for row in (1, 5, 12, 17, source_header_row):
             ws.format(f"A{row}:D{row}", self._header_format())
         ws.format(
-            "B17:D19",
+            "B18:D20",
             {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}},
         )
+        for cell in ("B2", "D2"):
+            ws.format(
+                cell,
+                {
+                    "numberFormat": {"type": "DATE", "pattern": "dd.mm.yyyy"},
+                    "backgroundColor": {"red": 0.92, "green": 0.88, "blue": 1},
+                    "textFormat": {"bold": True},
+                    "horizontalAlignment": "CENTER",
+                },
+            )
+        ws.format("A1:D40", {"wrapStrategy": "WRAP"})
+        self._set_dashboard_widths(ws)
 
         daily_header = [
             "Дата", "Зашли в бота", "Открыли тарифы",
@@ -250,7 +309,7 @@ class SheetsClient:
                 row["payments"], row["revenue"], row["commission"],
                 row["net"], row["conversion"],
             ]
-            for row in sources
+            for row in all_sources
         ]
         ws = self.sh.worksheet(SOURCES_SHEET)
         ws.clear()

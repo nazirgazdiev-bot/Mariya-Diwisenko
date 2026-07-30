@@ -696,11 +696,42 @@ async def _sheets_write_dashboard():
     if not sheets_client or not storage:
         return
     try:
-        metrics = await storage.dashboard_metrics()
         snapshot = await storage.report_snapshot()
         loop = asyncio.get_running_loop()
+        raw_start, raw_end = await loop.run_in_executor(
+            None, sheets_client.read_dashboard_period
+        )
+
+        def parse_sheet_date(value: str) -> str | None:
+            for pattern in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+                try:
+                    return datetime.strptime(value, pattern).date().isoformat()
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        today = datetime.now(timezone.utc).date().isoformat()
+        available_dates = [
+            row.get("date")
+            for row in snapshot.get("daily", [])
+            if row.get("date")
+        ]
+        default_start = min(available_dates) if available_dates else today
+        start_date = parse_sheet_date(raw_start) or default_start
+        end_date = parse_sheet_date(raw_end) or today
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+
+        metrics = await storage.dashboard_metrics(start_date, end_date)
+        period_sources = await storage.source_metrics(start_date, end_date)
         await loop.run_in_executor(
-            None, sheets_client.write_dashboard_snapshot, metrics, snapshot
+            None,
+            sheets_client.write_dashboard_snapshot,
+            metrics,
+            snapshot,
+            start_date,
+            end_date,
+            period_sources,
         )
     except Exception:
         log.exception("Не удалось обновить дашборд Google Sheets")

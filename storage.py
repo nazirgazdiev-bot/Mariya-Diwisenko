@@ -1001,7 +1001,11 @@ class Storage:
 
     # ---------- Метрики для дашборда Google Sheets ----------
 
-    async def dashboard_metrics(self) -> dict:
+    async def dashboard_metrics(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict:
         """Все счётчики для листа «Дашборд»:
         всего зашло / активных / пробных / истёкших / заблокировавших /
         оплативших хотя бы раз / продливших / оплативших но не продливших.
@@ -1010,21 +1014,54 @@ class Storage:
         "Не продлил" — у юзера ровно 1 успешный платёж И его подписка сейчас
         expired (то есть первый оплаченный период уже закончился, а нового
         платежа не было). Если платёж один и подписка ещё active — юзер
-        просто не успел продлить, это не считаем "не продлил"."""
+        просто не успел продлить, это не считаем "не продлил".
+
+        Если переданы обе даты, аудитория считается по дате входа в бота,
+        а оплаты — по дате успешного платежа внутри выбранного периода.
+        """
+        period_enabled = bool(start_date and end_date)
+        subscription_where = (
+            "WHERE substr(created_at, 1, 10) BETWEEN ? AND ?"
+            if period_enabled else ""
+        )
+        subscription_params = (
+            (start_date, end_date) if period_enabled else ()
+        )
+        payment_where = (
+            "WHERE p.status = 'success' "
+            "AND substr(p.created_at, 1, 10) BETWEEN ? AND ?"
+            if period_enabled else
+            "WHERE p.status = 'success'"
+        )
+        payment_params = (
+            (start_date, end_date) if period_enabled else ()
+        )
         async with aiosqlite.connect(self.db_path) as db:
             counts = {"active": 0, "trial": 0, "expired": 0}
             async with db.execute(
-                "SELECT status, COUNT(*) FROM subscriptions GROUP BY status"
+                f"""SELECT status, COUNT(*)
+                    FROM subscriptions
+                    {subscription_where}
+                    GROUP BY status""",
+                subscription_params,
             ) as cur:
                 for status, cnt in await cur.fetchall():
                     if status in counts:
                         counts[status] = cnt
 
-            async with db.execute("SELECT COUNT(*) FROM subscriptions") as cur:
+            async with db.execute(
+                f"SELECT COUNT(*) FROM subscriptions {subscription_where}",
+                subscription_params,
+            ) as cur:
                 total_registered = (await cur.fetchone())[0]
 
+            blocked_where = (
+                f"{subscription_where} AND blocked = 1"
+                if period_enabled else "WHERE blocked = 1"
+            )
             async with db.execute(
-                "SELECT COUNT(*) FROM subscriptions WHERE blocked = 1"
+                f"SELECT COUNT(*) FROM subscriptions {blocked_where}",
+                subscription_params,
             ) as cur:
                 blocked = (await cur.fetchone())[0]
 
@@ -1032,11 +1069,12 @@ class Storage:
             renewed = 0
             not_renewed = 0
             async with db.execute(
-                """SELECT p.user_id, COUNT(*), MAX(s.status)
+                f"""SELECT p.user_id, COUNT(*), MAX(s.status)
                    FROM payments p
                    LEFT JOIN subscriptions s ON s.user_id = p.user_id
-                   WHERE p.status = 'success'
-                   GROUP BY p.user_id"""
+                   {payment_where}
+                   GROUP BY p.user_id""",
+                payment_params,
             ) as cur:
                 rows = await cur.fetchall()
             for _user_id, pay_count, sub_status in rows:
@@ -1056,3 +1094,82 @@ class Storage:
             "renewed": renewed,
             "not_renewed": not_renewed,
         }
+
+    async def source_metrics(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> list[dict]:
+        """Регистрации и оплаты по источникам внутри выбранного периода."""
+        stats = {
+            tag: {
+                "source_tag": tag,
+                "registrations": 0,
+                "buyers": 0,
+                "payments": 0,
+                "revenue": 0,
+                "commission": 0,
+            }
+            for tag in (*SOURCE_TAGS, "direct")
+        }
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """SELECT
+                       COALESCE(NULLIF(c.source_tag, ''), 'direct') AS source_tag,
+                       COUNT(DISTINCT s.user_id)
+                   FROM subscriptions s
+                   LEFT JOIN clients c ON c.user_id = s.user_id
+                   WHERE substr(s.created_at, 1, 10) BETWEEN ? AND ?
+                   GROUP BY source_tag""",
+                (start_date, end_date),
+            ) as cur:
+                for source_tag, registrations in await cur.fetchall():
+                    stats.setdefault(source_tag, {
+                        "source_tag": source_tag,
+                        "registrations": 0,
+                        "buyers": 0,
+                        "payments": 0,
+                        "revenue": 0,
+                        "commission": 0,
+                    })
+                    stats[source_tag]["registrations"] = registrations
+
+            async with db.execute(
+                """SELECT
+                       COALESCE(NULLIF(c.source_tag, ''), 'direct') AS source_tag,
+                       COUNT(DISTINCT p.user_id),
+                       COUNT(p.id),
+                       COALESCE(SUM(p.amount), 0),
+                       COALESCE(SUM(p.commission_sum), 0)
+                   FROM payments p
+                   LEFT JOIN clients c ON c.user_id = p.user_id
+                   WHERE p.status = 'success'
+                     AND substr(p.created_at, 1, 10) BETWEEN ? AND ?
+                   GROUP BY source_tag""",
+                (start_date, end_date),
+            ) as cur:
+                for source_tag, buyers, payments, revenue, commission in await cur.fetchall():
+                    stats.setdefault(source_tag, {
+                        "source_tag": source_tag,
+                        "registrations": 0,
+                        "buyers": 0,
+                        "payments": 0,
+                        "revenue": 0,
+                        "commission": 0,
+                    })
+                    stats[source_tag].update({
+                        "buyers": buyers,
+                        "payments": payments,
+                        "revenue": revenue or 0,
+                        "commission": commission or 0,
+                    })
+
+        rows = []
+        for row in stats.values():
+            registrations = row["registrations"]
+            row["net"] = row["revenue"] - row["commission"]
+            row["conversion"] = (
+                row["buyers"] / registrations if registrations else 0
+            )
+            rows.append(row)
+        return rows
