@@ -124,5 +124,5 @@ class ProdamusClient:
         full = dict(str_data)
         full["signature"] = signature
         pairs = self._flatten(full)
-        query = "&".join(f"{quote(k, safe='[]')}={quote(str(v), safe='')}" for k, v in pairs)
+        query = "&".join(f"{quote(k, safe='')}={quote(str(v), safe='')}" for k, v in pairs)
         return f"{self.shop_url}?{query}"
