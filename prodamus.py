@@ -29,6 +29,10 @@ class ProdamusClient:
         obj_json = json.dumps(
             data, ensure_ascii=False, separators=(",", ":"), sort_keys=True
         )
+        # Prodamus подписывает JSON в формате PHP json_encode, где прямые
+        # слэши экранированы. Это важно для реальных webhook: например,
+        # payment_type содержит "Visa/MasterCard/МИР".
+        obj_json = obj_json.replace("/", r"\/")
         return hmac.new(
             self.secret.encode("utf-8"),
             msg=obj_json.encode("utf-8"),
