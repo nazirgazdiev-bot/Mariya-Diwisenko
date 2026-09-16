@@ -615,8 +615,18 @@ def serialized_ui(handler):
     async def wrapper(event, *args, **kwargs):
         user_id = str(event.from_user.id)
         lock = _ui_locks.setdefault(user_id, asyncio.Lock())
+        log.info("UI_REQUEST user_id=%s handler=%s waiting=%s", user_id, handler.__name__, lock.locked())
         async with lock:
-            return await handler(event, *args, **kwargs)
+            log.info("UI_STARTED user_id=%s handler=%s", user_id, handler.__name__)
+            try:
+                result = await handler(event, *args, **kwargs)
+            except Exception as error:
+                # Не записываем сообщение исключения: оно может содержать
+                # пользовательские данные или параметры запроса.
+                log.error("UI_FAILED user_id=%s handler=%s error_type=%s", user_id, handler.__name__, type(error).__name__)
+                raise
+            log.info("UI_FINISHED user_id=%s handler=%s", user_id, handler.__name__)
+            return result
     return wrapper
 
 
@@ -777,16 +787,21 @@ async def has_access(user_id: str) -> bool:
     """Активна ли подписка. Просроченную active сразу переводит в expired."""
     # Администраторы имеют постоянный доступ без покупки и paid_until.
     if user_is_admin(user_id):
+        log.info("ACCESS_CHECK user_id=%s allowed=True reason=admin", user_id)
         return True
     if not storage:
+        log.warning("ACCESS_CHECK user_id=%s allowed=True reason=storage_unavailable", user_id)
         return True  # без БД пейволл не работает — не блокируем бота
     sub = await storage.get_subscription(user_id)
     if not sub or sub["status"] != "active":
+        log.info("ACCESS_CHECK user_id=%s allowed=False reason=inactive status=%s", user_id, (sub or {}).get("status", "missing"))
         return False
     paid_until = sub.get("paid_until")
     if paid_until and paid_until <= now_utc().isoformat():
         await storage.upsert_subscription(user_id, status="expired")
+        log.info("ACCESS_CHECK user_id=%s allowed=False reason=expired", user_id)
         return False
+    log.info("ACCESS_CHECK user_id=%s allowed=True reason=active has_expiry=%s", user_id, bool(paid_until))
     return True
 
 async def send_welcome(chat_id: int):
@@ -1485,8 +1500,11 @@ async def send_categories_screen(user_id: str, chat_id: int):
 
 
 async def send_mariya_screen(user_id: str, chat_id: int):
+    log.info("MARIYA_SCREEN user_id=%s stage=cleanup_started", user_id)
     await enter_recipe_mode(user_id, chat_id)
+    log.info("MARIYA_SCREEN user_id=%s stage=cleanup_finished", user_id)
     await storage.set_mariya_mode(user_id, True)
+    log.info("MARIYA_SCREEN user_id=%s stage=mode_enabled", user_id)
     sent = await bot.send_message(
         chat_id,
         "🤖 <b>МарИИя — AI-нутрициолог</b>\n\n"
@@ -1499,7 +1517,9 @@ async def send_mariya_screen(user_id: str, chat_id: int):
         "/reset — полный сброс</i>",
         reply_markup=main_keyboard(),
     )
+    log.info("MARIYA_SCREEN user_id=%s stage=greeting_sent", user_id)
     await storage.set_menu_message_ids(user_id, [sent.message_id])
+    log.info("MARIYA_SCREEN user_id=%s stage=finished", user_id)
 
 
 @dp.message(F.text == "⭐ Избранное")
@@ -1749,16 +1769,19 @@ async def mariya_intro(message: Message):
 
 @dp.message(F.text)
 async def handle_text(message: Message):
+    uid = str(message.from_user.id)
     if not mariya or not storage:
+        log.warning("TEXT_ROUTE user_id=%s outcome=assistant_unavailable", uid)
         await message.answer("Ассистент временно недоступен.")
         return
 
-    uid = str(message.from_user.id)
     await storage.set_blocked(uid, False)  # написал нам — точно не заблокирован
 
     state = await storage.get_ui_state(uid)
     if not state["mariya_mode"]:
+        log.info("TEXT_ROUTE user_id=%s outcome=ignored reason=mariya_mode_disabled", uid)
         return
+    log.info("TEXT_ROUTE user_id=%s outcome=mariya_mode_enabled", uid)
 
     if not await has_access(uid):
         await send_tariff_card(message.chat.id)
