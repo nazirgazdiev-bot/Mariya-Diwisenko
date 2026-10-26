@@ -7,7 +7,7 @@ import os
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
@@ -23,6 +23,7 @@ from mariya import Mariya
 from prodamus import ProdamusClient
 from sheets import SheetsClient
 from storage import SOURCE_TAGS, Storage
+from manual_access import claim_grants
 
 load_dotenv()
 
@@ -1171,6 +1172,18 @@ async def sheets_sync_worker():
         await _sheets_write_dashboard()
         await asyncio.sleep(SHEETS_SYNC_INTERVAL)
 
+class ManualAccessMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        chat = data.get("event_chat")
+        if storage and user and user.username and chat and chat.type == "private":
+            await asyncio.to_thread(
+                claim_grants, storage.db_path, str(user.id), user.username,
+                next_renewal_schedule,
+            )
+        return await handler(event, data)
+
+
 # ─── Команды ─────────────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
@@ -1813,6 +1826,8 @@ async def main():
     global storage, mariya, sheets_client
     storage = Storage(DB_PATH)
     await storage.init()
+    dp.message.outer_middleware(ManualAccessMiddleware())
+    dp.callback_query.outer_middleware(ManualAccessMiddleware())
     mariya = Mariya(
         anthropic_key=ANTHROPIC_API_KEY,
         recipes_data=data,
