@@ -343,8 +343,8 @@ class Mariya:
         self,
         anthropic_key: str,
         recipes_data: dict,
-        model: str = "claude-haiku-4-5-20251001",
-        learn_model: str = "claude-haiku-4-5-20251001",
+        model: str = "claude-haiku-5-5",
+        learn_model: str = "claude-haiku-5-5",
     ):
         self.client = AsyncAnthropic(api_key=anthropic_key)
         self.recipes_data = recipes_data
@@ -353,6 +353,13 @@ class Mariya:
         self.valid_names = {r["name"].lower() for r in recipes_data["recipes"]}
         self.model = model
         self.learn_model = learn_model
+
+    @staticmethod
+    def _model_options(model: str) -> dict:
+        # Preserve direct replies within the existing token limits on Haiku 5.5.
+        if model == "claude-haiku-5-5":
+            return {"thinking": {"type": "disabled"}}
+        return {}
 
     def _build_system(self, client_ctx: str) -> list[dict]:
         return [
@@ -390,6 +397,7 @@ class Mariya:
                     max_tokens=2048,
                     system=self._build_system(client_ctx),
                     messages=messages,
+                    **self._model_options(self.model),
                 )
                 # Собираем текст из всех текстовых блоков
                 parts = []
@@ -446,6 +454,7 @@ class Mariya:
                 model=self.learn_model,
                 max_tokens=400,
                 messages=[{"role": "user", "content": prompt}],
+                **self._model_options(self.learn_model),
             )
             text = "".join(getattr(b, "text", "") for b in resp.content).strip()
             if text.startswith("```"):

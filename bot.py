@@ -31,8 +31,8 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 DB_PATH = os.environ.get("DB_PATH", "mariya_data.db")
 MENU_PATH = os.environ.get("MENU_PATH", "menu.json")
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
-LEARN_MODEL = os.environ.get("LEARN_MODEL", "claude-haiku-4-5-20251001")
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
+LEARN_MODEL = os.environ.get("LEARN_MODEL", "claude-haiku-5-5")
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID")  # legacy: один администратор
 ADMIN_USER_IDS = {
     user_id.strip()
