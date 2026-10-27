@@ -171,11 +171,92 @@ class Storage:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id, id)"
             )
+            async with db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='mariya_daily_usage'"
+            ) as cur:
+                quota_exists = await cur.fetchone() is not None
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS mariya_daily_usage (
+                    user_id TEXT NOT NULL,
+                    usage_date TEXT NOT NULL,
+                    request_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, usage_date)
+                )""")
+            # On first activation count today's AI messages already in history.
+            # Subsequent restarts never rebuild or reset the persistent counters.
+            async with db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_access_grants'"
+            ) as cur:
+                grants_exist = await cur.fetchone() is not None
+            if not quota_exists and grants_exist:
+                samara_now = datetime.now(timezone(timedelta(hours=4)))
+                day_start = samara_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+                day_end = day_start + timedelta(days=1)
+                await db.execute(
+                    """INSERT INTO mariya_daily_usage (user_id, usage_date, request_count)
+                       SELECT d.user_id, ?, min(count(*), 10) FROM dialog d
+                       WHERE d.role='user' AND d.created_at >= ? AND d.created_at < ?
+                         AND EXISTS (SELECT 1 FROM manual_access_grants g
+                                     WHERE g.user_id=d.user_id AND g.claimed_at IS NOT NULL)
+                         AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.user_id=d.user_id
+                                         AND p.status='success' AND p.amount > 0)
+                       GROUP BY d.user_id
+                       ON CONFLICT(user_id, usage_date) DO NOTHING""",
+                    (samara_now.date().isoformat(), day_start.isoformat(), day_end.isoformat()),
+                )
             await db.commit()
 
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    async def consume_mariya_request(
+        self, user_id: str, *, limit: int = 10, now: datetime | None = None,
+    ) -> bool:
+        """Reserve one AI request for a manually granted, never-paid account.
+
+        Paid accounts and accounts without manual grants are unrestricted.
+        The transaction prevents concurrent messages from exceeding the cap.
+        A new Samara calendar date starts a new bucket without a reset job.
+        """
+        instant = now if now is not None else datetime.now(timezone.utc)
+        if instant.utcoffset() is None:
+            raise ValueError("Quota timestamps must include a timezone")
+        usage_date = instant.astimezone(timezone(timedelta(hours=4))).date().isoformat()
+        async with aiosqlite.connect(self.db_path, timeout=30) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT 1 FROM payments WHERE user_id=? "
+                "AND status='success' AND amount > 0 LIMIT 1", (user_id,),
+            ) as cur:
+                paid = await cur.fetchone()
+            async with db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='manual_access_grants'"
+            ) as cur:
+                has_grants = await cur.fetchone()
+            free = False
+            if has_grants and not paid:
+                async with db.execute(
+                    "SELECT 1 FROM manual_access_grants WHERE user_id=? "
+                    "AND claimed_at IS NOT NULL LIMIT 1", (user_id,),
+                ) as cur:
+                    free = await cur.fetchone() is not None
+            if not free:
+                await db.commit()
+                return True
+            async with db.execute(
+                """INSERT INTO mariya_daily_usage (user_id, usage_date, request_count)
+                   VALUES (?, ?, 1)
+                   ON CONFLICT(user_id, usage_date) DO UPDATE
+                   SET request_count = request_count + 1
+                   WHERE request_count < ?
+                   RETURNING request_count""",
+                (user_id, usage_date, limit),
+            ) as cur:
+                allowed = await cur.fetchone() is not None
+            await db.commit()
+            return allowed
 
     # ---------- Клиенты ----------
 

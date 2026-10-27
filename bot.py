@@ -33,6 +33,10 @@ DB_PATH = os.environ.get("DB_PATH", "mariya_data.db")
 MENU_PATH = os.environ.get("MENU_PATH", "menu.json")
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 LEARN_MODEL = os.environ.get("LEARN_MODEL", "claude-haiku-5-5")
+FREE_MARIYA_DAILY_LIMIT = 10
+MARIYA_DAILY_LIMIT_TEXT = (
+    "Ты исчерпала дневной лимит — 10 обращений. Возвращайся завтра 💛"
+)
 ADMIN_USER_ID = os.environ.get("ADMIN_USER_ID")  # legacy: один администратор
 ADMIN_USER_IDS = {
     user_id.strip()
@@ -744,8 +748,14 @@ async def _sheets_write_dashboard():
             end_date,
             period_sources,
         )
+        _diag["sheets_last_synced_at"] = datetime.now(timezone.utc).isoformat()
+        _diag["sheets_last_error_at"] = None
+        log.info("SHEETS_SYNC_OK users=%s daily_rows=%s", len(snapshot.get("users", [])), len(snapshot.get("daily", [])))
+        return True
     except Exception:
+        _diag["sheets_last_error_at"] = datetime.now(timezone.utc).isoformat()
         log.exception("Не удалось обновить дашборд Google Sheets")
+        return False
 
 
 def _to_float(value) -> float | None:
@@ -774,6 +784,8 @@ _diag = {
     "last_funnel_error_step": None,
     "last_funnel_error_at": None,
     "last_funnel_step_sent": None,
+    "sheets_last_synced_at": None,
+    "sheets_last_error_at": None,
     "funnel_test_mode": None,  # выставится ниже, после чтения FUNNEL_TEST_MODE
 }
 _diag["funnel_test_mode"] = FUNNEL_TEST_MODE
@@ -1801,6 +1813,15 @@ async def handle_text(message: Message):
         return
 
     user_text = message.text.strip()
+    if not user_text:
+        return
+
+    if not user_is_admin(uid) and not await storage.consume_mariya_request(
+        uid, limit=FREE_MARIYA_DAILY_LIMIT,
+    ):
+        log.info("MARIYA_DAILY_LIMIT user_id=%s", uid)
+        await message.answer(MARIYA_DAILY_LIMIT_TEXT, parse_mode=None)
+        return
 
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 

@@ -2,10 +2,14 @@
 
 import json
 import logging
+import random
+import threading
+import time
 from datetime import datetime, timezone
 
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.utils import a1_range_to_grid_range
 
 log = logging.getLogger("sheets")
 
@@ -32,6 +36,7 @@ class SheetsClient:
         creds = Credentials.from_service_account_info(info, scopes=SCOPES)
         self.gc = gspread.authorize(creds)
         self.sheet_id = sheet_id
+        self._lock = threading.RLock()
         self.sh = self.gc.open_by_key(sheet_id)
         self._ensure_sheets()
 
@@ -47,38 +52,106 @@ class SheetsClient:
             "verticalAlignment": "MIDDLE",
         }
 
-    def _ensure_sheets(self):
-        titles = [ws.title for ws in self.sh.worksheets()]
-        if PAYMENTS_SHEET not in titles:
-            ws = self.sh.add_worksheet(
-                title=PAYMENTS_SHEET, rows=1000, cols=len(PAYMENTS_HEADER)
-            )
-            ws.append_row(PAYMENTS_HEADER, value_input_option="USER_ENTERED")
-        else:
-            ws = self.sh.worksheet(PAYMENTS_SHEET)
-            if ws.col_count < len(PAYMENTS_HEADER):
-                ws.resize(cols=len(PAYMENTS_HEADER))
-            if ws.row_values(1) != PAYMENTS_HEADER:
-                ws.update([PAYMENTS_HEADER], "A1")
+    @staticmethod
+    def _cell(value):
+        if value is None or value == "":
+            return {}
+        if isinstance(value, bool):
+            return {"userEnteredValue": {"boolValue": value}}
+        if isinstance(value, (int, float)):
+            return {"userEnteredValue": {"numberValue": value}}
+        return {"userEnteredValue": {"stringValue": str(value)}}
 
+    def _retry(self, operation, *args, retry_statuses=(429, 500, 502, 503, 504), **kwargs):
+        for attempt in range(4):
+            try:
+                return operation(*args, **kwargs)
+            except gspread.exceptions.APIError as error:
+                status = getattr(error.response, "status_code", None)
+                if status not in retry_statuses or attempt == 3:
+                    raise
+                delay = min(15 * (2 ** attempt) + random.random(), 60)
+                log.warning("Google Sheets temporary HTTP %s; retry in %.1fs", status, delay)
+                time.sleep(delay)
+
+    def _batch_update(self, requests):
+        with self._lock:
+            return self._retry(self.sh.batch_update, {"requests": requests})
+
+    @staticmethod
+    def _format_request(ws, range_name, cell_format):
+        return {
+            "repeatCell": {
+                "range": a1_range_to_grid_range(range_name, sheet_id=ws.id),
+                "cell": {"userEnteredFormat": cell_format},
+                "fields": ",".join("userEnteredFormat." + key for key in cell_format),
+            }
+        }
+
+    def _ensure_sheets(self):
+        self._worksheets = {ws.title: ws for ws in self.sh.worksheets()}
         for title, rows, cols in (
+            (PAYMENTS_SHEET, 1000, len(PAYMENTS_HEADER)),
             (DASHBOARD_SHEET, 50, 4),
             (USERS_SHEET, 1000, 16),
             (DAILY_SHEET, 1000, 12),
             (SEGMENTS_SHEET, 30, 4),
             (SOURCES_SHEET, 100, 8),
         ):
-            if title not in titles:
-                self.sh.add_worksheet(title=title, rows=rows, cols=cols)
+            if title not in self._worksheets:
+                self._worksheets[title] = self.sh.add_worksheet(title=title, rows=rows, cols=cols)
+        self._grid_sizes = {
+            title: (ws.row_count, ws.col_count) for title, ws in self._worksheets.items()
+        }
+        ws = self._worksheets[PAYMENTS_SHEET]
+        requests = [{
+            "updateSheetProperties": {
+                "properties": {"sheetId": ws.id, "gridProperties": {
+                    "rowCount": max(ws.row_count, 1000),
+                    "columnCount": max(ws.col_count, len(PAYMENTS_HEADER)),
+                    "frozenRowCount": 1,
+                }},
+                "fields": "gridProperties.rowCount,gridProperties.columnCount,gridProperties.frozenRowCount",
+            }
+        }]
+        if ws.row_values(1) != PAYMENTS_HEADER:
+            requests.append({"updateCells": {
+                "start": {"sheetId": ws.id, "rowIndex": 0, "columnIndex": 0},
+                "rows": [{"values": [self._cell(value) for value in PAYMENTS_HEADER]}],
+                "fields": "userEnteredValue",
+            }})
+        requests.extend([
+            self._format_request(ws, "A1:I1", self._header_format()),
+            self._format_request(ws, "D2:F1000", {
+                "numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"},
+            }),
+            {"setBasicFilter": {"filter": {"range": a1_range_to_grid_range("A1:I1000", sheet_id=ws.id)}}},
+        ])
+        self._batch_update(requests)
 
-        ws = self.sh.worksheet(PAYMENTS_SHEET)
-        ws.freeze(rows=1)
-        ws.format("A1:I1", self._header_format())
-        ws.format(
-            "D2:F1000",
-            {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}},
-        )
-        ws.set_basic_filter("A1:I1000")
+    def _snapshot_requests(self, title, rows, cols, min_rows, frozen_rows=1, frozen_cols=0):
+        ws = self._worksheets[title]
+        old_rows, old_cols = self._grid_sizes[title]
+        row_count, col_count = max(old_rows, min_rows, len(rows)), max(old_cols, cols)
+        requests = [{
+            "updateSheetProperties": {
+                "properties": {"sheetId": ws.id, "gridProperties": {
+                    "rowCount": row_count, "columnCount": col_count,
+                    "frozenRowCount": frozen_rows, "frozenColumnCount": frozen_cols,
+                }},
+                "fields": "gridProperties.rowCount,gridProperties.columnCount,"
+                          "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
+            }
+        }, {
+            "updateCells": {
+                # Uncovered cells inside this managed range lose stale values.
+                "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": row_count,
+                          "startColumnIndex": 0, "endColumnIndex": cols},
+                "rows": [{"values": [self._cell(value) for value in row]} for row in rows],
+                "fields": "userEnteredValue",
+            }
+        }]
+        return requests, (row_count, col_count)
 
     def log_payment(
         self,
@@ -90,34 +163,33 @@ class SheetsClient:
         order_id: str,
         source_tag: str,
     ):
-        ws = self.sh.worksheet(PAYMENTS_SHEET)
+        ws = self._worksheets[PAYMENTS_SHEET]
         amount = amount or 0
         commission_sum = commission_sum or 0
-        ws.append_row(
-            [
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                str(user_id),
-                tier,
-                amount,
-                commission_sum,
-                round(amount - commission_sum, 2),
-                status,
-                order_id or "",
-                source_tag or "direct",
-            ],
-            value_input_option="USER_ENTERED",
-        )
+        with self._lock:
+            # A 429 rejects the append; retry it without retrying uncertain writes.
+            self._retry(
+                ws.append_row,
+                [
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    str(user_id), tier, amount, commission_sum,
+                    round(amount - commission_sum, 2), status,
+                    order_id or "", source_tag or "direct",
+                ],
+                value_input_option="USER_ENTERED", retry_statuses=(429,),
+            )
 
     def read_dashboard_period(self) -> tuple[str, str]:
         """Возвращает выбранные пользователем даты из строки 2 дашборда."""
-        ws = self.sh.worksheet(DASHBOARD_SHEET)
-        values = ws.get("B2:D2")
+        ws = self._worksheets[DASHBOARD_SHEET]
+        with self._lock:
+            values = self._retry(ws.get, "B2:D2")
         row = values[0] if values else []
         start_date = row[0] if len(row) > 0 else ""
         end_date = row[2] if len(row) > 2 else ""
         return str(start_date).strip(), str(end_date).strip()
 
-    def _set_dashboard_widths(self, ws):
+    def _dashboard_width_requests(self, ws):
         """Фиксированные ширины не дают подписям обрезаться на дашборде."""
         widths = (250, 170, 170, 170)
         requests = []
@@ -134,7 +206,7 @@ class SheetsClient:
                     "fields": "pixelSize",
                 }
             })
-        self.sh.batch_update({"requests": requests})
+        return requests
 
     def write_dashboard_snapshot(
         self,
@@ -145,6 +217,27 @@ class SheetsClient:
         period_sources: list[dict],
     ):
         """Записывает готовые числа: никаких формул, зависящих от локали Sheets."""
+        # Refresh dimensions once, then commit values and formatting atomically.
+        # Keep existing extra rows/columns rather than shrinking user sheets.
+        with self._lock:
+            metadata = self._retry(self.sh.fetch_sheet_metadata, params={"fields": "sheets(properties)"})
+            for item in metadata.get("sheets", []):
+                props = item["properties"]
+                grid = props.get("gridProperties", {})
+                self._grid_sizes[props["title"]] = (grid.get("rowCount", 1000), grid.get("columnCount", 16))
+        requests = []
+        grid_sizes = {}
+        def write_values(title, rows, cols, min_rows, frozen_rows=1, frozen_cols=0):
+            queued, size = self._snapshot_requests(title, rows, cols, min_rows, frozen_rows, frozen_cols)
+            requests.extend(queued)
+            grid_sizes[title] = size
+            return self._worksheets[title]
+        def format_cells(ws, range_name, cell_format):
+            requests.append(self._format_request(ws, range_name, cell_format))
+        def set_filter(ws, range_name):
+            requests.append({"setBasicFilter": {"filter": {
+                "range": a1_range_to_grid_range(range_name, sheet_id=ws.id),
+            }}})
         now = datetime.now(timezone.utc)
         today = now.date().isoformat()
         daily = snapshot.get("daily", [])
@@ -207,19 +300,21 @@ class SheetsClient:
                 "По источникам",
             ],
         ])
-        ws = self.sh.worksheet(DASHBOARD_SHEET)
-        ws.clear()
-        ws.update(dashboard_rows, "A1", value_input_option="USER_ENTERED")
-        ws.freeze(rows=3)
+        # Sheets stores calendar dates as days since 1899-12-30.
+        for index, date_text in ((1, start_date), (3, end_date)):
+            dashboard_rows[1][index] = (
+                datetime.strptime(date_text, "%Y-%m-%d") - datetime(1899, 12, 30)
+            ).days
+        ws = write_values(DASHBOARD_SHEET, dashboard_rows, 4, 50, frozen_rows=3)
         source_header_row = 22
         for row in (1, 5, 12, 17, source_header_row):
-            ws.format(f"A{row}:D{row}", self._header_format())
-        ws.format(
+            format_cells(ws, f"A{row}:D{row}", self._header_format())
+        format_cells(ws, 
             "B18:D20",
             {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}},
         )
         for cell in ("B2", "D2"):
-            ws.format(
+            format_cells(ws, 
                 cell,
                 {
                     "numberFormat": {"type": "DATE", "pattern": "dd.mm.yyyy"},
@@ -228,8 +323,8 @@ class SheetsClient:
                     "horizontalAlignment": "CENTER",
                 },
             )
-        ws.format("A1:D40", {"wrapStrategy": "WRAP"})
-        self._set_dashboard_widths(ws)
+        format_cells(ws, "A1:D40", {"wrapStrategy": "WRAP"})
+        requests.extend(self._dashboard_width_requests(ws))
 
         daily_header = [
             "Дата", "Зашли в бота", "Открыли тарифы",
@@ -246,25 +341,17 @@ class SheetsClient:
             ]
             for row in daily
         ]
-        ws = self.sh.worksheet(DAILY_SHEET)
-        ws.clear()
-        ws.resize(rows=max(1000, len(daily_rows) + 1), cols=12)
-        ws.update(
-            [daily_header] + daily_rows,
-            "A1",
-            value_input_option="USER_ENTERED",
-        )
-        ws.freeze(rows=1)
-        ws.format("A1:L1", self._header_format())
-        ws.format(
+        ws = write_values(DAILY_SHEET, [daily_header] + daily_rows, 12, 1000)
+        format_cells(ws, "A1:L1", self._header_format())
+        format_cells(ws, 
             "I2:K1000",
             {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}},
         )
-        ws.format(
+        format_cells(ws, 
             "L2:L1000",
             {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}},
         )
-        ws.set_basic_filter("A1:L1000")
+        set_filter(ws, "A1:L1000")
 
         users_header = [
             "Дата входа", "Telegram user_id", "Имя", "Username", "Статус",
@@ -283,21 +370,13 @@ class SheetsClient:
             ]
             for u in snapshot.get("users", [])
         ]
-        ws = self.sh.worksheet(USERS_SHEET)
-        ws.clear()
-        ws.resize(rows=max(1000, len(users_rows) + 1), cols=16)
-        ws.update(
-            [users_header] + users_rows,
-            "A1",
-            value_input_option="USER_ENTERED",
-        )
-        ws.freeze(rows=1, cols=2)
-        ws.format("A1:P1", self._header_format())
-        ws.format(
+        ws = write_values(USERS_SHEET, [users_header] + users_rows, 16, 1000, frozen_cols=2)
+        format_cells(ws, "A1:P1", self._header_format())
+        format_cells(ws, 
             "M2:O1000",
             {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}},
         )
-        ws.set_basic_filter("A1:P1000")
+        set_filter(ws, "A1:P1000")
 
         sources_header = [
             "Источник", "Регистрации", "Уникальные покупатели", "Количество оплат",
@@ -311,25 +390,17 @@ class SheetsClient:
             ]
             for row in all_sources
         ]
-        ws = self.sh.worksheet(SOURCES_SHEET)
-        ws.clear()
-        ws.resize(rows=max(100, len(sources_rows) + 1), cols=8)
-        ws.update(
-            [sources_header] + sources_rows,
-            "A1",
-            value_input_option="USER_ENTERED",
-        )
-        ws.freeze(rows=1)
-        ws.format("A1:H1", self._header_format())
-        ws.format(
+        ws = write_values(SOURCES_SHEET, [sources_header] + sources_rows, 8, 100)
+        format_cells(ws, "A1:H1", self._header_format())
+        format_cells(ws, 
             "E2:G100",
             {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}},
         )
-        ws.format(
+        format_cells(ws, 
             "H2:H100",
             {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}},
         )
-        ws.set_basic_filter("A1:H100")
+        set_filter(ws, "A1:H100")
 
         segments_rows = [
             ["Сегмент", "Кто входит", "Код", "Пример команды"],
@@ -344,8 +415,9 @@ class SheetsClient:
             ["Как отправить", "Отправить команду боту с Telegram-аккаунта администратора", "", ""],
             ["Важно", "Рассылка пропускает пользователей, заблокировавших бота", "", ""],
         ]
-        ws = self.sh.worksheet(SEGMENTS_SHEET)
-        ws.clear()
-        ws.update(segments_rows, "A1", value_input_option="USER_ENTERED")
-        ws.freeze(rows=1)
-        ws.format("A1:D1", self._header_format())
+        ws = write_values(SEGMENTS_SHEET, segments_rows, 4, 30)
+        format_cells(ws, "A1:D1", self._header_format())
+
+        with self._lock:
+            self._batch_update(requests)
+            self._grid_sizes.update(grid_sizes)
