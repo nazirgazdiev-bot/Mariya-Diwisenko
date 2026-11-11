@@ -13,7 +13,7 @@ from pathlib import Path
 import aiosqlite
 
 _UNSET = object()  # отличаем "не передали" от явного None в upsert_subscription
-SOURCE_TAGS = ("inst", "youtube", "tg_bot", "tg_channel", "tg_students")
+SOURCE_TAGS = ("inst", "youtube", "tg_bot", "tg_channel", "tg_students", "traffic_1211_26")
 
 
 class Storage:
