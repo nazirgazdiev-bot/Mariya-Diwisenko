@@ -1881,10 +1881,54 @@ async def handle_text(message: Message):
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
+def reserve_november_access(db_path):
+    from contextlib import closing
+    from pathlib import Path
+    import sqlite3
+
+    from manual_access import reserve_grants
+
+    if now_utc() >= datetime(2026, 11, 12, 12, tzinfo=timezone.utc):
+        return
+    username = "pro100maaria"
+    batch = "pro100maaria-20261111-3m"
+    database = Path(db_path).resolve(strict=True)
+    with closing(sqlite3.connect(database, timeout=30)) as source:
+        grant_table = source.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_access_grants'"
+        ).fetchone()
+        existing = grant_table and source.execute(
+            "SELECT 1 FROM manual_access_grants WHERE batch_id = ? AND username = ?",
+            (batch, username),
+        ).fetchone()
+        if not existing:
+            stamp = now_utc().strftime("%Y%m%dT%H%M%S%fZ")
+            backup_path = database.with_name(f"before-grant-{batch}-{stamp}.db")
+            with closing(sqlite3.connect(backup_path)) as backup:
+                source.backup(backup)
+                if backup.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                    raise RuntimeError("Access grant backup failed integrity check")
+
+    reserve_grants(str(database), batch, [{"username": username, "tier": "3m"}])
+    with closing(sqlite3.connect(database, timeout=30)) as db:
+        tier, days, issued, until, claimed = db.execute(
+            "SELECT tier, days, issued_at, paid_until, claimed_at "
+            "FROM manual_access_grants WHERE batch_id = ? AND username = ?",
+            (batch, username),
+        ).fetchone()
+    if tier != "3m" or days != 90 or datetime.fromisoformat(until) - datetime.fromisoformat(issued) != timedelta(days=90):
+        raise RuntimeError("Access grant does not match requested duration")
+    log.info("MANUAL_GRANT_OK username=%s days=%s until=%s claimed=%s", username, days, until, bool(claimed))
+
+
 async def main():
     global storage, mariya, sheets_client
     storage = Storage(DB_PATH)
     await storage.init()
+    try:
+        await asyncio.to_thread(reserve_november_access, DB_PATH)
+    except Exception:
+        log.exception("One-time access grant failed")
     dp.message.outer_middleware(ManualAccessMiddleware())
     dp.callback_query.outer_middleware(ManualAccessMiddleware())
     mariya = Mariya(
