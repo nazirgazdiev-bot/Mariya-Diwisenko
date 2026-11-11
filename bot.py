@@ -1874,5 +1874,43 @@ async def main():
         sheets_sync_worker(),
     )
 
+@dp.message(Command("demo_checkout"))
+async def cmd_demo_checkout(message: Message):
+    """Temporary Prodamus demo link for the approved campaign test order."""
+    from hashlib import sha256
+
+    args = (message.text or "").split()
+    if len(args) != 2 or now_utc() >= datetime(2026, 11, 12, tzinfo=timezone.utc):
+        return
+    order_id = args[1]
+    if sha256(order_id.encode()).hexdigest() != "ccb2bf1f3550e7a737320284f8b1ab6bb31a32ee442a4b8b25fb3cf6523d2cad":
+        return
+    uid = str(message.from_user.id)
+    if not order_id.startswith(f"{uid}_1m_") or message.chat.type != "private":
+        return
+    if not storage or not prodamus_client:
+        await message.answer("Демоссылка сейчас недоступна.")
+        return
+    client = await storage.get_client(uid)
+    if client.get("source_tag") != "traffic_1211_26" or await storage.payment_exists(order_id):
+        return
+    link = prodamus_client.build_payment_link({
+        "do": "pay",
+        "order_id": order_id,
+        "demo_mode": 1,
+        "products": [{
+            "name": TIERS["1m"]["title"],
+            "price": TIERS["1m"]["price"],
+            "quantity": 1,
+        }],
+    })
+    await message.answer(
+        "Тестовая оплата Продамуса. Используй только тестовую карту.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Открыть демоформу", url=link)]
+        ]),
+    )
+
+
 if __name__ == "__main__":
     asyncio.run(main())
